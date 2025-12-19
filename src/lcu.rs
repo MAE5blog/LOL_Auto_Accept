@@ -11,6 +11,8 @@ use std::{
 
 use anyhow::Context;
 
+use crate::logger;
+
 #[derive(Clone, Default)]
 pub struct LcuOverrides {
     lockfile: Option<PathBuf>,
@@ -46,48 +48,82 @@ impl LcuOverrides {
 
 #[derive(Clone)]
 struct LcuAuth {
+    protocol: String,
     port: u16,
     password: String,
 }
 
 pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
+    logger::info("lcu worker start");
+
     let client = match build_client() {
         Ok(client) => client,
-        Err(_) => return,
+        Err(err) => {
+            logger::error(&format!("build HTTP client failed: {err:?}"));
+            return;
+        }
     };
 
+    let candidates = candidate_lockfile_paths(&overrides);
+    if candidates.is_empty() {
+        logger::warn("no candidate lockfile paths (use --lol-dir or --lockfile)");
+    } else {
+        logger::info(&format!("candidate lockfiles ({}):", candidates.len()));
+        for path in candidates {
+            logger::info(&format!("  {}", path.display()));
+        }
+    }
+
     let mut accepted_this_ready_check = false;
-    let mut auth: Option<LcuAuth> = None;
+    let mut connection: Option<(LcuAuth, PathBuf)> = None;
+    let mut last_phase: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
-        if auth.is_none() {
-            auth = read_lockfile_auth(&overrides);
+        if connection.is_none() {
+            connection = discover_connection(&client, &overrides);
             accepted_this_ready_check = false;
+            last_phase = None;
 
-            if auth.is_none() {
+            if connection.is_none() {
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         }
 
-        let Some(lcu) = auth.as_ref() else {
+        let Some((auth, lockfile_path)) = connection.as_ref() else {
             continue;
         };
 
-        let phase = match get_gameflow_phase(&client, lcu) {
+        let phase = match get_gameflow_phase(&client, auth) {
             Ok(phase) => phase,
-            Err(_) => {
-                auth = None;
+            Err(err) => {
+                logger::warn(&format!(
+                    "LCU request failed (lockfile={}): {err:?}",
+                    lockfile_path.display()
+                ));
+                connection = None;
                 accepted_this_ready_check = false;
                 std::thread::sleep(Duration::from_secs(1));
                 continue;
             }
         };
 
+        if last_phase.as_deref() != Some(phase.as_str()) {
+            logger::info(&format!("gameflow phase: {phase}"));
+            last_phase = Some(phase.clone());
+        }
+
         if phase == "ReadyCheck" {
             if !accepted_this_ready_check {
-                if accept_ready_check(&client, lcu).is_ok() {
-                    accepted_this_ready_check = true;
+                logger::info("ready-check: attempting accept");
+                match accept_ready_check(&client, auth) {
+                    Ok(()) => {
+                        logger::info("ready-check: accepted");
+                        accepted_this_ready_check = true;
+                    }
+                    Err(err) => {
+                        logger::warn(&format!("ready-check accept failed: {err:?}"));
+                    }
                 }
             }
         } else {
@@ -96,11 +132,79 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
 
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    logger::info("lcu worker stop");
+}
+
+fn discover_connection(
+    client: &reqwest::blocking::Client,
+    overrides: &LcuOverrides,
+) -> Option<(LcuAuth, PathBuf)> {
+    for path in candidate_lockfile_paths(overrides) {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(_) => continue,
+        };
+
+        let auth = match parse_lockfile(contents.trim()) {
+            Some(auth) => auth,
+            None => {
+                logger::warn(&format!("invalid lockfile format: {}", path.display()));
+                continue;
+            }
+        };
+
+        if let Err(err) = probe_connection(client, &auth) {
+            logger::warn(&format!(
+                "lockfile found but probe failed ({}): {err:?}",
+                path.display()
+            ));
+            continue;
+        }
+
+        logger::info(&format!(
+            "LCU connected (protocol={}, port={}, lockfile={})",
+            auth.protocol,
+            auth.port,
+            path.display()
+        ));
+        return Some((auth, path));
+    }
+
+    None
+}
+
+fn probe_connection(client: &reqwest::blocking::Client, auth: &LcuAuth) -> anyhow::Result<()> {
+    let url = format!("{}/lol-gameflow/v1/gameflow-phase", base_url(auth));
+    let response = client
+        .get(url)
+        .basic_auth("riot", Some(&auth.password))
+        .send()
+        .context("probe /lol-gameflow/v1/gameflow-phase")?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("probe status {}", response.status())
+    }
+}
+
+fn base_url(auth: &LcuAuth) -> String {
+    format!("{}://127.0.0.1:{}", auth.protocol, auth.port)
+}
+
+fn trim_for_log(text: &str) -> String {
+    const LIMIT: usize = 512;
+    if text.len() <= LIMIT {
+        return text.to_string();
+    }
+    format!("{}...(truncated)", &text[..LIMIT])
 }
 
 fn build_client() -> anyhow::Result<reqwest::blocking::Client> {
     reqwest::blocking::ClientBuilder::new()
         .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
         .timeout(Duration::from_secs(2))
         .build()
         .context("build HTTP client")
@@ -110,10 +214,7 @@ fn get_gameflow_phase(
     client: &reqwest::blocking::Client,
     auth: &LcuAuth,
 ) -> anyhow::Result<String> {
-    let url = format!(
-        "https://127.0.0.1:{}/lol-gameflow/v1/gameflow-phase",
-        auth.port
-    );
+    let url = format!("{}/lol-gameflow/v1/gameflow-phase", base_url(auth));
 
     let response = client
         .get(url)
@@ -125,17 +226,17 @@ fn get_gameflow_phase(
     let body = response.text().unwrap_or_default();
 
     if !status.is_success() {
-        anyhow::bail!("gameflow phase HTTP status: {status}");
+        anyhow::bail!(
+            "gameflow phase HTTP status: {status}, body={}",
+            trim_for_log(&body)
+        );
     }
 
     serde_json::from_str(&body).context("parse gameflow phase")
 }
 
 fn accept_ready_check(client: &reqwest::blocking::Client, auth: &LcuAuth) -> anyhow::Result<()> {
-    let url = format!(
-        "https://127.0.0.1:{}/lol-matchmaking/v1/ready-check/accept",
-        auth.port
-    );
+    let url = format!("{}/lol-matchmaking/v1/ready-check/accept", base_url(auth));
 
     let response = client
         .post(url)
@@ -143,28 +244,17 @@ fn accept_ready_check(client: &reqwest::blocking::Client, auth: &LcuAuth) -> any
         .send()
         .context("POST /lol-matchmaking/v1/ready-check/accept")?;
 
-    if response.status().is_success() {
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+
+    if status.is_success() {
         Ok(())
     } else {
-        anyhow::bail!("ready-check accept HTTP status: {}", response.status());
+        anyhow::bail!(
+            "ready-check accept HTTP status: {status}, body={}",
+            trim_for_log(&body)
+        );
     }
-}
-
-fn read_lockfile_auth(overrides: &LcuOverrides) -> Option<LcuAuth> {
-    for path in candidate_lockfile_paths(overrides) {
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(_) => continue,
-        };
-
-        let auth = match parse_lockfile(contents.trim()) {
-            Some(auth) => auth,
-            None => continue,
-        };
-
-        return Some(auth);
-    }
-    None
 }
 
 fn parse_lockfile(contents: &str) -> Option<LcuAuth> {
@@ -173,10 +263,19 @@ fn parse_lockfile(contents: &str) -> Option<LcuAuth> {
         return None;
     }
 
+    let protocol = match parts[4].trim().to_ascii_lowercase().as_str() {
+        "https" => "https".to_string(),
+        "http" => "http".to_string(),
+        _ => "https".to_string(),
+    };
     let port = parts[2].parse().ok()?;
     let password = parts[3].to_string();
 
-    Some(LcuAuth { port, password })
+    Some(LcuAuth {
+        protocol,
+        port,
+        password,
+    })
 }
 
 fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
