@@ -74,6 +74,19 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
         }
     }
 
+    let running = running_league_lockfile_paths();
+    if running.is_empty() {
+        logger::info("running League client lockfiles: none");
+    } else {
+        logger::info(&format!(
+            "running League client lockfiles ({}):",
+            running.len()
+        ));
+        for path in running {
+            logger::info(&format!("  {}", path.display()));
+        }
+    }
+
     let mut accepted_this_ready_check = false;
     let mut connection: Option<(LcuAuth, PathBuf)> = None;
     let mut last_phase: Option<String> = None;
@@ -140,16 +153,32 @@ fn discover_connection(
     client: &reqwest::blocking::Client,
     overrides: &LcuOverrides,
 ) -> Option<(LcuAuth, PathBuf)> {
-    for path in candidate_lockfile_paths(overrides) {
+    let mut paths = running_league_lockfile_paths();
+    paths.extend(candidate_lockfile_paths(overrides));
+
+    let mut seen = HashSet::<String>::new();
+    let mut deduped = Vec::new();
+    for path in paths {
+        let key = path_key(&path);
+        if seen.insert(key) {
+            deduped.push(path);
+        }
+    }
+
+    for path in deduped {
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(_) => continue,
         };
 
-        let auth = match parse_lockfile(contents.trim()) {
+        let auth = match parse_lockfile(&contents) {
             Some(auth) => auth,
             None => {
-                logger::warn(&format!("invalid lockfile format: {}", path.display()));
+                logger::warn(&format!(
+                    "invalid lockfile format: {} ({})",
+                    path.display(),
+                    lockfile_debug_summary(&contents)
+                ));
                 continue;
             }
         };
@@ -258,24 +287,87 @@ fn accept_ready_check(client: &reqwest::blocking::Client, auth: &LcuAuth) -> any
 }
 
 fn parse_lockfile(contents: &str) -> Option<LcuAuth> {
-    let parts: Vec<&str> = contents.split(':').collect();
-    if parts.len() != 5 {
+    let mut contents = contents.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}');
+    contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+    if contents.is_empty() {
         return None;
     }
 
-    let protocol = match parts[4].trim().to_ascii_lowercase().as_str() {
-        "https" => "https".to_string(),
-        "http" => "http".to_string(),
-        _ => "https".to_string(),
+    let parts: Vec<&str> = contents.split(':').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let (port_str, password_str, protocol_str) = if parts.len() >= 5 {
+        (
+            parts[parts.len() - 3],
+            parts[parts.len() - 2],
+            parts[parts.len() - 1],
+        )
+    } else {
+        (parts[1], parts[2], parts[3])
     };
-    let port = parts[2].parse().ok()?;
-    let password = parts[3].to_string();
+
+    let port: u16 = port_str.trim().parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+
+    let password = password_str.trim().to_string();
+    if password.is_empty() {
+        return None;
+    }
+
+    let protocol = protocol_str.trim().to_ascii_lowercase();
+    if protocol != "https" && protocol != "http" {
+        return None;
+    }
 
     Some(LcuAuth {
         protocol,
         port,
         password,
     })
+}
+
+fn lockfile_debug_summary(contents: &str) -> String {
+    let mut contents = contents.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}');
+    contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
+
+    let len = contents.len();
+    let colons = contents.as_bytes().iter().filter(|&&b| b == b':').count();
+    let parts: Vec<&str> = contents.split(':').collect();
+
+    let first = parts.first().map(|p| p.trim()).unwrap_or("<empty>");
+    let first = if first.chars().count() > 32 {
+        let prefix: String = first.chars().take(32).collect();
+        format!("{prefix}...")
+    } else {
+        first.to_string()
+    };
+
+    let last = parts
+        .last()
+        .map(|p| p.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let last = if last == "http" || last == "https" {
+        last
+    } else {
+        "<redacted>".to_string()
+    };
+
+    let mut nums = Vec::new();
+    for (idx, part) in parts.iter().enumerate() {
+        if let Ok(v) = part.trim().parse::<u32>() {
+            nums.push(format!("{idx}={v}"));
+        }
+    }
+
+    format!(
+        "len={len}, colons={colons}, parts={}, first=\"{first}\", last=\"{last}\", nums=[{}]",
+        parts.len(),
+        nums.join(",")
+    )
 }
 
 fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
@@ -310,6 +402,85 @@ fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
     }
 
     paths
+}
+
+fn running_league_lockfile_paths() -> Vec<PathBuf> {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                TH32CS_SNAPPROCESS,
+            },
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+                PROCESS_QUERY_LIMITED_INFORMATION,
+            },
+        },
+    };
+
+    let mut results = Vec::new();
+
+    unsafe {
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return results,
+        };
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let exe_name = utf16_nul_terminated_to_string(&entry.szExeFile);
+
+            if is_league_client_process(&exe_name) {
+                let pid = entry.th32ProcessID;
+
+                if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                    let mut buffer = vec![0u16; 32 * 1024];
+                    let mut len: u32 = buffer.len().try_into().unwrap_or(u32::MAX);
+
+                    let ok = QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_FORMAT(0),
+                        windows::core::PWSTR(buffer.as_mut_ptr()),
+                        &mut len,
+                    )
+                    .is_ok();
+
+                    if ok {
+                        let path = String::from_utf16_lossy(&buffer[..len as usize]);
+                        let path = PathBuf::from(path);
+                        if let Some(dir) = path.parent() {
+                            results.push(dir.join("lockfile"));
+                        }
+                    }
+
+                    let _ = CloseHandle(process);
+                }
+            }
+
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+
+    let mut seen = HashSet::<String>::new();
+    results.retain(|path| seen.insert(path_key(path)));
+    results
+}
+
+fn utf16_nul_terminated_to_string(buf: &[u16]) -> String {
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn is_league_client_process(exe_name: &str) -> bool {
+    exe_name.eq_ignore_ascii_case("LeagueClientUx.exe")
+        || exe_name.eq_ignore_ascii_case("LeagueClientUxRender.exe")
+        || exe_name.eq_ignore_ascii_case("LeagueClient.exe")
 }
 
 fn riot_installed_league_dirs() -> Vec<PathBuf> {
