@@ -1,17 +1,43 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 
 use crate::logger;
+
+static LOG_THROTTLE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn should_log_throttled(key: &str, interval_ms: u64) -> bool {
+    let now = now_ms();
+    let map = LOG_THROTTLE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let Ok(mut map) = map.lock() else {
+        return true;
+    };
+
+    match map.get(key).copied() {
+        Some(last) if now.saturating_sub(last) < interval_ms => false,
+        _ => {
+            map.insert(key.to_string(), now);
+            true
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct LcuOverrides {
@@ -110,9 +136,7 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
         let phase = match get_gameflow_phase(&client, auth) {
             Ok(phase) => phase,
             Err(err) => {
-                logger::warn(&format!(
-                    "LCU request failed (source={source}): {err:?}"
-                ));
+                logger::warn(&format!("LCU request failed (source={source}): {err:?}"));
                 connection = None;
                 accepted_this_ready_check = false;
                 std::thread::sleep(Duration::from_secs(1));
@@ -171,17 +195,29 @@ fn discover_connection(
     for path in paths.into_iter().filter(|p| seen.insert(path_key(p))) {
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(_) => continue,
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::NotFound
+                    && should_log_throttled(&format!("lockfile_read:{}", path_key(&path)), 10_000)
+                {
+                    logger::warn(&format!(
+                        "failed to read lockfile: {} ({err})",
+                        path.display()
+                    ));
+                }
+                continue;
+            }
         };
 
         let auth = match parse_lockfile(&contents) {
             Some(auth) => auth,
             None => {
-                logger::warn(&format!(
-                    "invalid lockfile format: {} ({})",
-                    path.display(),
-                    lockfile_debug_summary(&contents)
-                ));
+                if should_log_throttled(&format!("lockfile_parse:{}", path_key(&path)), 10_000) {
+                    logger::warn(&format!(
+                        "invalid lockfile format: {} ({})",
+                        path.display(),
+                        lockfile_debug_summary(&contents)
+                    ));
+                }
                 continue;
             }
         };
@@ -511,7 +547,12 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         },
     };
 
-    use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+    use windows::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation,
+    };
+
+    const STATUS_BUFFER_TOO_SMALL: i32 = 0xC0000023u32 as i32;
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC0000004u32 as i32;
 
     #[repr(C)]
     #[derive(Default)]
@@ -552,7 +593,72 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         process_parameters: *mut RtlUserProcessParameters,
     }
 
-    unsafe fn read_command_line(
+    unsafe fn read_command_line_ntquery(
+        process: windows::Win32::Foundation::HANDLE,
+    ) -> anyhow::Result<String> {
+        let mut size_bytes = 16 * 1024;
+        for _ in 0..6 {
+            let mut buffer_u16 = vec![0u16; (size_bytes + 1) / 2];
+            let buffer_size = (buffer_u16.len() * 2) as u32;
+
+            let mut return_len = 0u32;
+            let status = NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                buffer_u16.as_mut_ptr() as *mut c_void,
+                buffer_size,
+                &mut return_len,
+            );
+
+            if status.0 == STATUS_INFO_LENGTH_MISMATCH || status.0 == STATUS_BUFFER_TOO_SMALL {
+                let suggested = return_len as usize;
+                size_bytes = size_bytes
+                    .max(suggested)
+                    .saturating_add(4096)
+                    .saturating_mul(2);
+                continue;
+            }
+
+            if status.0 < 0 {
+                anyhow::bail!(
+                    "NtQueryInformationProcess(ProcessCommandLineInformation) failed: {status:?}"
+                );
+            }
+
+            let ustr: UnicodeString =
+                std::ptr::read_unaligned(buffer_u16.as_ptr() as *const UnicodeString);
+
+            if ustr.length == 0 || ustr.buffer.is_null() {
+                anyhow::bail!("command line is empty");
+            }
+
+            let base = buffer_u16.as_ptr() as usize;
+            let end = base + buffer_u16.len() * 2;
+            let ptr = ustr.buffer as usize;
+
+            if ptr < base || ptr.saturating_add(ustr.length as usize) > end {
+                anyhow::bail!("command line buffer points outside returned buffer");
+            }
+
+            let offset_bytes = ptr - base;
+            if offset_bytes % 2 != 0 {
+                anyhow::bail!("command line buffer is not u16-aligned");
+            }
+
+            let offset_u16 = offset_bytes / 2;
+            let len_u16 = (ustr.length as usize) / 2;
+            if offset_u16.saturating_add(len_u16) > buffer_u16.len() {
+                anyhow::bail!("command line length out of bounds");
+            }
+
+            let slice = &buffer_u16[offset_u16..offset_u16 + len_u16];
+            return Ok(String::from_utf16_lossy(slice));
+        }
+
+        anyhow::bail!("command line query exceeded retry budget")
+    }
+
+    unsafe fn read_command_line_peb(
         process: windows::Win32::Foundation::HANDLE,
     ) -> anyhow::Result<String> {
         let mut info = ProcessBasicInfo::default();
@@ -617,7 +723,7 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         Ok(String::from_utf16_lossy(&buffer))
     }
 
-    fn parse_auth_from_command_line(cmd: &str) -> Option<LcuAuth> {
+    fn parse_auth_from_command_line(cmd: &str) -> Result<LcuAuth, String> {
         let mut port: Option<u16> = None;
         let mut password: Option<String> = None;
         let mut protocol: Option<String> = None;
@@ -656,10 +762,17 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
             }
         }
 
-        Some(LcuAuth {
+        let port = port.ok_or_else(|| "missing --app-port".to_string())?;
+        if port == 0 {
+            return Err("invalid --app-port=0".to_string());
+        }
+
+        let password = password.ok_or_else(|| "missing --remoting-auth-token".to_string())?;
+
+        Ok(LcuAuth {
             protocol: protocol.unwrap_or_else(|| "https".to_string()),
-            port: port?,
-            password: password?,
+            port,
+            password,
         })
     }
 
@@ -677,56 +790,115 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
         while ok {
             let exe_name = utf16_nul_terminated_to_string(&entry.szExeFile);
-            if !exe_name.eq_ignore_ascii_case("LeagueClientUx.exe") {
+            if !is_league_client_process(&exe_name) {
                 ok = Process32NextW(snapshot, &mut entry).is_ok();
                 continue;
             }
 
             let pid = entry.th32ProcessID;
 
-            if let Ok(process) = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                false,
-                pid,
-            ) {
-                let mut exe_buf = vec![0u16; 32 * 1024];
-                let mut exe_len: u32 = exe_buf.len().try_into().unwrap_or(u32::MAX);
-                let exe_path = if QueryFullProcessImageNameW(
-                    process,
-                    PROCESS_NAME_FORMAT(0),
-                    windows::core::PWSTR(exe_buf.as_mut_ptr()),
-                    &mut exe_len,
-                )
-                .is_ok()
-                {
-                    Some(PathBuf::from(String::from_utf16_lossy(
-                        &exe_buf[..exe_len as usize],
-                    )))
-                } else {
-                    None
-                };
+            let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(process) => process,
+                Err(err) => {
+                    if should_log_throttled(&format!("open_process:{pid}:{exe_name}"), 10_000) {
+                        logger::warn(&format!(
+                            "OpenProcess failed (pid={pid}, exe={exe_name}): {err:?}"
+                        ));
+                    }
+                    ok = Process32NextW(snapshot, &mut entry).is_ok();
+                    continue;
+                }
+            };
 
-                match read_command_line(process) {
-                    Ok(cmd) => {
-                        if let Some(auth) = parse_auth_from_command_line(&cmd) {
-                            let source = if let Some(exe_path) = exe_path {
-                                format!("pid={pid}, exe={}", exe_path.display())
-                            } else {
-                                format!("pid={pid}")
-                            };
-                            results.push((auth, source));
+            let mut exe_buf = vec![0u16; 32 * 1024];
+            let mut exe_len: u32 = exe_buf.len().try_into().unwrap_or(u32::MAX);
+            let exe_path = if QueryFullProcessImageNameW(
+                process,
+                PROCESS_NAME_FORMAT(0),
+                windows::core::PWSTR(exe_buf.as_mut_ptr()),
+                &mut exe_len,
+            )
+            .is_ok()
+            {
+                Some(PathBuf::from(String::from_utf16_lossy(
+                    &exe_buf[..exe_len as usize],
+                )))
+            } else {
+                None
+            };
+
+            let source_base = if let Some(exe_path) = exe_path.as_ref() {
+                format!("pid={pid}, exe_name={exe_name}, exe={}", exe_path.display())
+            } else {
+                format!("pid={pid}, exe_name={exe_name}")
+            };
+
+            let cmd = match read_command_line_ntquery(process) {
+                Ok(cmd) => Some(cmd),
+                Err(err) => {
+                    if should_log_throttled(&format!("cmdline_ntq:{pid}"), 10_000) {
+                        logger::warn(&format!(
+                            "failed to read command line (NtQuery) ({source_base}): {err:?}"
+                        ));
+                    }
+                    None
+                }
+            };
+
+            if let Some(cmd) = cmd {
+                match parse_auth_from_command_line(&cmd) {
+                    Ok(auth) => results.push((auth, format!("{source_base}, via=cmdline_ntq"))),
+                    Err(reason) => {
+                        if should_log_throttled(&format!("cmdline_parse:{pid}"), 10_000) {
+                            logger::warn(&format!(
+                                "process command line missing LCU args ({source_base}): {reason}"
+                            ));
                         }
                     }
+                }
+            } else {
+                let process_vm = match OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                    false,
+                    pid,
+                ) {
+                    Ok(process) => process,
                     Err(err) => {
-                        logger::warn(&format!(
-                            "failed to read command line for LeagueClientUx.exe (pid={pid}): {err:?}"
-                        ));
+                        if should_log_throttled(&format!("open_process_vm:{pid}"), 10_000) {
+                            logger::warn(&format!(
+                                "OpenProcess(PROCESS_VM_READ) failed ({source_base}): {err:?}"
+                            ));
+                        }
+                        let _ = CloseHandle(process);
+                        ok = Process32NextW(snapshot, &mut entry).is_ok();
+                        continue;
+                    }
+                };
+
+                match read_command_line_peb(process_vm) {
+                    Ok(cmd) => match parse_auth_from_command_line(&cmd) {
+                        Ok(auth) => results.push((auth, format!("{source_base}, via=cmdline_peb"))),
+                        Err(reason) => {
+                            if should_log_throttled(&format!("cmdline_peb_parse:{pid}"), 10_000) {
+                                logger::warn(&format!(
+                                    "process command line missing LCU args ({source_base}): {reason}"
+                                ));
+                            }
+                        }
+                    },
+                    Err(err) => {
+                        if should_log_throttled(&format!("cmdline_peb:{pid}"), 10_000) {
+                            logger::warn(&format!(
+                                "failed to read command line (PEB) ({source_base}): {err:?}"
+                            ));
+                        }
                     }
                 }
 
-                let _ = CloseHandle(process);
+                let _ = CloseHandle(process_vm);
             }
 
+            let _ = CloseHandle(process);
             ok = Process32NextW(snapshot, &mut entry).is_ok();
         }
 
