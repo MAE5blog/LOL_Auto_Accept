@@ -197,7 +197,7 @@ fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
         paths.push(PathBuf::from(dir).join("lockfile"));
     }
 
-    if let Some(riot_dir) = riot_installed_league_dir() {
+    for riot_dir in riot_installed_league_dirs() {
         paths.push(riot_dir.join("lockfile"));
     }
 
@@ -212,35 +212,45 @@ fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
     paths
 }
 
-fn riot_installed_league_dir() -> Option<PathBuf> {
-    let programdata = std::env::var_os("PROGRAMDATA")?;
+fn riot_installed_league_dirs() -> Vec<PathBuf> {
+    let Some(programdata) = std::env::var_os("PROGRAMDATA") else {
+        return Vec::new();
+    };
+
     let installs_path = PathBuf::from(programdata)
         .join("Riot Games")
         .join("RiotClientInstalls.json");
 
-    let contents = fs::read_to_string(installs_path).ok()?;
-    let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
-
-    if let Some(path) = json.get("league_of_legends.live").and_then(|v| v.as_str()) {
-        return normalize_league_install_path(PathBuf::from(path));
-    }
-
-    let serde_json::Value::Object(map) = json else {
-        return None;
+    let Ok(contents) = fs::read_to_string(installs_path) else {
+        return Vec::new();
     };
 
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return Vec::new();
+    };
+
+    let serde_json::Value::Object(map) = json else {
+        return Vec::new();
+    };
+
+    let mut results = Vec::new();
     for (key, value) in map {
         if !key.starts_with("league_of_legends") {
             continue;
         }
-        if let Some(path) = value.as_str() {
-            if let Some(path) = normalize_league_install_path(PathBuf::from(path)) {
-                return Some(path);
-            }
+        let Some(path) = value.as_str() else {
+            continue;
+        };
+        let Some(path) = normalize_league_install_path(PathBuf::from(path)) else {
+            continue;
+        };
+
+        if !results.iter().any(|p: &PathBuf| p == &path) {
+            results.push(path);
         }
     }
 
-    None
+    results
 }
 
 fn normalize_league_install_path(path: PathBuf) -> Option<PathBuf> {

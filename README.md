@@ -12,6 +12,8 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 
 默认会尝试从 `C:\ProgramData\Riot Games\RiotClientInstalls.json` 和常见安装路径定位 `lockfile`。
 
+如果你电脑上装了多个服/多个客户端，建议用参数或环境变量“指定要监听的那个安装目录”，避免定位到另一个客户端。
+
 如果你的安装路径比较特殊，可用环境变量指定：
 
 - `LOL_LOCKFILE`：直接指定 `lockfile` 完整路径
