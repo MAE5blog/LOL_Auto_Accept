@@ -8,6 +8,11 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 - 轮询 `GET /lol-gameflow/v1/gameflow-phase`
 - 当进入 `ReadyCheck` 时调用 `POST /lol-matchmaking/v1/ready-check/accept`
 
+## 正式版说明
+
+- 托盘常驻，右键菜单只有“退出”
+- 默认不输出日志、不生成日志文件
+
 ## 配置（可选）
 
 默认会尝试从 `C:\ProgramData\Riot Games\RiotClientInstalls.json` 和常见安装路径定位 `lockfile`。
@@ -23,14 +28,6 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 
 - `--lockfile <path>`
 - `--lol-dir <path>`
-
-## 日志 / Debug
-
-程序会写运行日志到文件（优先写在 exe 同目录的 `lol_plugin.log`；若无权限则回退到 `%LOCALAPPDATA%\lol_plugin\lol_plugin.log` 或 `%TEMP%\lol_plugin.log`）。
-
-如果你需要在运行时看到日志输出，可以构建一个带控制台窗口的版本：
-
-- `cargo build --release --features console`
 
 ## 构建（Windows）
 

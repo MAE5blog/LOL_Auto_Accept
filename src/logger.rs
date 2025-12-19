@@ -1,3 +1,4 @@
+#[cfg(feature = "console")]
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -6,34 +7,33 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "console")]
 static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
-pub fn init() -> PathBuf {
-    if let Some(path) = LOG_PATH.get() {
-        return path.clone();
-    }
-
-    let (file, path) = open_default_log_file();
-    let _ = LOG_PATH.set(path.clone());
-    let _ = LOG_FILE.set(Mutex::new(file));
-
-    info(&format!("log file: {}", path.display()));
-    path
+#[cfg(feature = "console")]
+pub fn init() {
+    let _ = LOG_FILE.get_or_init(|| Mutex::new(open_default_log_file()));
 }
 
+#[cfg(not(feature = "console"))]
+pub fn init() {}
+
+#[cfg(feature = "console")]
 pub fn info(message: &str) {
     write_line("INFO", message);
 }
 
+#[cfg(feature = "console")]
 pub fn warn(message: &str) {
     write_line("WARN", message);
 }
 
+#[cfg(feature = "console")]
 pub fn error(message: &str) {
     write_line("ERROR", message);
 }
 
+#[cfg(feature = "console")]
 fn write_line(level: &str, message: &str) {
     let ts_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -49,17 +49,15 @@ fn write_line(level: &str, message: &str) {
         }
     }
 
-    #[cfg(any(debug_assertions, feature = "console"))]
-    {
-        if level == "ERROR" {
-            eprint!("{line}");
-        } else {
-            print!("{line}");
-        }
+    if level == "ERROR" {
+        eprint!("{line}");
+    } else {
+        print!("{line}");
     }
 }
 
-fn open_default_log_file() -> (File, PathBuf) {
+#[cfg(feature = "console")]
+fn open_default_log_file() -> File {
     let candidates = [
         log_path_next_to_exe(),
         log_path_in_local_app_data(),
@@ -68,15 +66,14 @@ fn open_default_log_file() -> (File, PathBuf) {
 
     for candidate in candidates.into_iter().flatten() {
         if let Ok(file) = open_log_file(&candidate) {
-            return (file, candidate);
+            return file;
         }
     }
 
-    let fallback = std::env::temp_dir().join("lol_plugin.log");
-    let file = open_log_file(&fallback).expect("failed to create log file");
-    (file, fallback)
+    open_log_file(&std::env::temp_dir().join("lol_plugin.log")).expect("failed to create log file")
 }
 
+#[cfg(feature = "console")]
 fn open_log_file(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -84,12 +81,14 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().create(true).append(true).open(path)
 }
 
+#[cfg(feature = "console")]
 fn log_path_next_to_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     Some(dir.join("lol_plugin.log"))
 }
 
+#[cfg(feature = "console")]
 fn log_path_in_local_app_data() -> Option<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")?;
     Some(

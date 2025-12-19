@@ -3,8 +3,6 @@ use std::sync::{
     Arc, OnceLock,
 };
 
-use crate::logger;
-
 use windows::{
     core::w,
     Win32::{
@@ -34,7 +32,7 @@ const TRAY_UID: u32 = 1;
 const ID_TRAY_EXIT: usize = 1001;
 
 pub fn run(overrides: crate::lcu::LcuOverrides) -> anyhow::Result<()> {
-    logger::info("tray start");
+    log_info!("tray start");
 
     let stop = Arc::new(AtomicBool::new(false));
     let _ = STOP.set(stop.clone());
@@ -46,7 +44,7 @@ pub fn run(overrides: crate::lcu::LcuOverrides) -> anyhow::Result<()> {
     let mut notify_data = unsafe { init_tray()? };
     unsafe { message_loop() };
 
-    logger::info("tray stop requested");
+    log_info!("tray stop requested");
     stop.store(true, Ordering::SeqCst);
     let _ = worker.join();
 
@@ -145,7 +143,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_COMMAND => {
                 let id = (wparam.0 & 0xffff) as usize;
                 if id == ID_TRAY_EXIT {
-                    logger::info("tray exit clicked");
+                    log_info!("tray exit clicked");
                     if let Some(stop) = STOP.get() {
                         stop.store(true, Ordering::SeqCst);
                     }

@@ -4,40 +4,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc,
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::Context;
-
-use crate::logger;
-
-static LOG_THROTTLE: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-fn should_log_throttled(key: &str, interval_ms: u64) -> bool {
-    let now = now_ms();
-    let map = LOG_THROTTLE.get_or_init(|| Mutex::new(HashMap::new()));
-
-    let Ok(mut map) = map.lock() else {
-        return true;
-    };
-
-    match map.get(key).copied() {
-        Some(last) if now.saturating_sub(last) < interval_ms => false,
-        _ => {
-            map.insert(key.to_string(), now);
-            true
-        }
-    }
-}
 
 #[derive(Clone, Default)]
 pub struct LcuOverrides {
@@ -80,38 +52,15 @@ struct LcuAuth {
 }
 
 pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
-    logger::info("lcu worker start");
+    log_info!("lcu worker start");
 
     let client = match build_client() {
         Ok(client) => client,
-        Err(err) => {
-            logger::error(&format!("build HTTP client failed: {err:?}"));
+        Err(_err) => {
+            log_error!("build HTTP client failed: {_err:?}");
             return;
         }
     };
-
-    let candidates = candidate_lockfile_paths(&overrides);
-    if candidates.is_empty() {
-        logger::warn("no candidate lockfile paths (use --lol-dir or --lockfile)");
-    } else {
-        logger::info(&format!("candidate lockfiles ({}):", candidates.len()));
-        for path in candidates {
-            logger::info(&format!("  {}", path.display()));
-        }
-    }
-
-    let running = running_league_lockfile_paths();
-    if running.is_empty() {
-        logger::info("running League client lockfiles: none");
-    } else {
-        logger::info(&format!(
-            "running League client lockfiles ({}):",
-            running.len()
-        ));
-        for path in running {
-            logger::info(&format!("  {}", path.display()));
-        }
-    }
 
     let mut accepted_this_ready_check = false;
     let mut connection: Option<(LcuAuth, String)> = None;
@@ -129,14 +78,14 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
             }
         }
 
-        let Some((auth, source)) = connection.as_ref() else {
+        let Some((auth, _source)) = connection.as_ref() else {
             continue;
         };
 
         let phase = match get_gameflow_phase(&client, auth) {
             Ok(phase) => phase,
-            Err(err) => {
-                logger::warn(&format!("LCU request failed (source={source}): {err:?}"));
+            Err(_err) => {
+                log_warn!("LCU request failed (source={_source}): {_err:?}");
                 connection = None;
                 accepted_this_ready_check = false;
                 std::thread::sleep(Duration::from_secs(1));
@@ -145,20 +94,20 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
         };
 
         if last_phase.as_deref() != Some(phase.as_str()) {
-            logger::info(&format!("gameflow phase: {phase}"));
+            log_info!("gameflow phase: {phase}");
             last_phase = Some(phase.clone());
         }
 
         if phase == "ReadyCheck" {
             if !accepted_this_ready_check {
-                logger::info("ready-check: attempting accept");
+                log_info!("ready-check: attempting accept");
                 match accept_ready_check(&client, auth) {
                     Ok(()) => {
-                        logger::info("ready-check: accepted");
+                        log_info!("ready-check: accepted");
                         accepted_this_ready_check = true;
                     }
-                    Err(err) => {
-                        logger::warn(&format!("ready-check accept failed: {err:?}"));
+                    Err(_err) => {
+                        log_warn!("ready-check accept failed: {_err:?}");
                     }
                 }
             }
@@ -169,7 +118,7 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    logger::info("lcu worker stop");
+    log_info!("lcu worker stop");
 }
 
 fn discover_connection(
@@ -177,14 +126,15 @@ fn discover_connection(
     overrides: &LcuOverrides,
 ) -> Option<(LcuAuth, String)> {
     for (auth, source) in running_league_auths_from_processes() {
-        if let Err(err) = probe_connection(client, &auth) {
-            logger::warn(&format!("process auth probe failed ({source}): {err:?}"));
+        if let Err(_err) = probe_connection(client, &auth) {
+            log_warn!("process auth probe failed ({source}): {_err:?}");
             continue;
         }
-        logger::info(&format!(
+        log_info!(
             "LCU connected via process (protocol={}, port={}, source={source})",
-            auth.protocol, auth.port
-        ));
+            auth.protocol,
+            auth.port
+        );
         return Some((auth, source));
     }
 
@@ -195,47 +145,35 @@ fn discover_connection(
     for path in paths.into_iter().filter(|p| seen.insert(path_key(p))) {
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound
-                    && should_log_throttled(&format!("lockfile_read:{}", path_key(&path)), 10_000)
-                {
-                    logger::warn(&format!(
-                        "failed to read lockfile: {} ({err})",
-                        path.display()
-                    ));
-                }
-                continue;
-            }
+            Err(_) => continue,
         };
 
         let auth = match parse_lockfile(&contents) {
             Some(auth) => auth,
             None => {
-                if should_log_throttled(&format!("lockfile_parse:{}", path_key(&path)), 10_000) {
-                    logger::warn(&format!(
-                        "invalid lockfile format: {} ({})",
-                        path.display(),
-                        lockfile_debug_summary(&contents)
-                    ));
-                }
+                log_warn!(
+                    "invalid lockfile format: {} ({})",
+                    path.display(),
+                    lockfile_debug_summary(&contents)
+                );
                 continue;
             }
         };
 
-        if let Err(err) = probe_connection(client, &auth) {
-            logger::warn(&format!(
-                "lockfile found but probe failed ({}): {err:?}",
+        if let Err(_err) = probe_connection(client, &auth) {
+            log_warn!(
+                "lockfile found but probe failed ({}): {_err:?}",
                 path.display()
-            ));
+            );
             continue;
         }
 
-        logger::info(&format!(
+        log_info!(
             "LCU connected (protocol={}, port={}, lockfile={})",
             auth.protocol,
             auth.port,
             path.display()
-        ));
+        );
         return Some((auth, format!("lockfile={}", path.display())));
     }
 
@@ -369,6 +307,7 @@ fn parse_lockfile(contents: &str) -> Option<LcuAuth> {
     })
 }
 
+#[cfg(feature = "console")]
 fn lockfile_debug_summary(contents: &str) -> String {
     let mut contents = contents.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}');
     contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
@@ -601,35 +540,28 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
     }
 
     impl PartialAuth {
-        fn merge(&mut self, other: PartialAuth, key: &str) {
+        fn merge(&mut self, other: PartialAuth, _key: &str) {
             if self.protocol.is_none() {
                 self.protocol = other.protocol;
             } else if let (Some(a), Some(b)) = (self.protocol.as_ref(), other.protocol.as_ref()) {
-                if a != b && should_log_throttled(&format!("auth_conflict:{key}:protocol"), 10_000)
-                {
-                    logger::warn(&format!(
-                        "conflicting LCU protocol for same client dir ({key}): {a} vs {b}"
-                    ));
+                if a != b {
+                    log_warn!("conflicting LCU protocol for same client dir ({_key}): {a} vs {b}");
                 }
             }
 
             if self.port.is_none() {
                 self.port = other.port;
             } else if let (Some(a), Some(b)) = (self.port, other.port) {
-                if a != b && should_log_throttled(&format!("auth_conflict:{key}:port"), 10_000) {
-                    logger::warn(&format!(
-                        "conflicting LCU port for same client dir ({key}): {a} vs {b}"
-                    ));
+                if a != b {
+                    log_warn!("conflicting LCU port for same client dir ({_key}): {a} vs {b}");
                 }
             }
 
             if self.password.is_none() {
                 self.password = other.password;
             } else if let (Some(a), Some(b)) = (self.password.as_ref(), other.password.as_ref()) {
-                if a != b && should_log_throttled(&format!("auth_conflict:{key}:token"), 10_000) {
-                    logger::warn(&format!(
-                        "conflicting LCU remoting-auth-token for same client dir ({key})"
-                    ));
+                if a != b {
+                    log_warn!("conflicting LCU remoting-auth-token for same client dir ({_key})");
                 }
             }
         }
@@ -888,12 +820,8 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
 
             let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
                 Ok(process) => process,
-                Err(err) => {
-                    if should_log_throttled(&format!("open_process:{pid}:{exe_name}"), 10_000) {
-                        logger::warn(&format!(
-                            "OpenProcess failed (pid={pid}, exe={exe_name}): {err:?}"
-                        ));
-                    }
+                Err(_err) => {
+                    log_warn!("OpenProcess failed (pid={pid}, exe={exe_name}): {_err:?}");
                     ok = Process32NextW(snapshot, &mut entry).is_ok();
                     continue;
                 }
@@ -933,12 +861,8 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
 
             let (cmd, cmd_source) = match read_command_line_ntquery(process) {
                 Ok(cmd) => (Some(cmd), "cmdline_ntq"),
-                Err(err) => {
-                    if should_log_throttled(&format!("cmdline_ntq:{pid}"), 10_000) {
-                        logger::warn(&format!(
-                            "failed to read command line (NtQuery) ({source_base}): {err:?}"
-                        ));
-                    }
+                Err(_err) => {
+                    log_warn!("failed to read command line (NtQuery) ({source_base}): {_err:?}");
                     (None, "cmdline_ntq")
                 }
             };
@@ -958,10 +882,8 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                         .sources
                         .push(format!("{source_base}, via={cmd_source}"));
                     entry.partial.merge(partial, &client_dir_key);
-                } else if should_log_throttled(&format!("cmdline_no_lcu:{pid}"), 10_000) {
-                    logger::warn(&format!(
-                        "process command line has no LCU args ({source_base})"
-                    ));
+                } else {
+                    log_warn!("process command line has no LCU args ({source_base})");
                 }
             } else {
                 let process_vm = match OpenProcess(
@@ -970,12 +892,8 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                     pid,
                 ) {
                     Ok(process) => process,
-                    Err(err) => {
-                        if should_log_throttled(&format!("open_process_vm:{pid}"), 10_000) {
-                            logger::warn(&format!(
-                                "OpenProcess(PROCESS_VM_READ) failed ({source_base}): {err:?}"
-                            ));
-                        }
+                    Err(_err) => {
+                        log_warn!("OpenProcess(PROCESS_VM_READ) failed ({source_base}): {_err:?}");
                         let _ = CloseHandle(process);
                         ok = Process32NextW(snapshot, &mut entry).is_ok();
                         continue;
@@ -999,19 +917,12 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                                 .sources
                                 .push(format!("{source_base}, via=cmdline_peb"));
                             entry.partial.merge(partial, &client_dir_key);
-                        } else if should_log_throttled(&format!("cmdline_peb_no_lcu:{pid}"), 10_000)
-                        {
-                            logger::warn(&format!(
-                                "process command line has no LCU args ({source_base})"
-                            ));
+                        } else {
+                            log_warn!("process command line has no LCU args ({source_base})");
                         }
                     }
-                    Err(err) => {
-                        if should_log_throttled(&format!("cmdline_peb:{pid}"), 10_000) {
-                            logger::warn(&format!(
-                                "failed to read command line (PEB) ({source_base}): {err:?}"
-                            ));
-                        }
+                    Err(_err) => {
+                        log_warn!("failed to read command line (PEB) ({source_base}): {_err:?}");
                     }
                 }
 
@@ -1026,10 +937,10 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
     }
 
     let mut results = Vec::new();
-    for (key, group) in groups {
+    for (_key, group) in groups {
         let partial = group.partial.clone();
-        let has_port = partial.port.is_some();
-        let has_token = partial.password.is_some();
+        let _has_port = partial.port.is_some();
+        let _has_token = partial.password.is_some();
 
         if let Some(auth) = partial.into_auth() {
             let sources = if group.sources.is_empty() {
@@ -1041,13 +952,13 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                 auth,
                 format!("client_dir={}, sources={}", group.dir.display(), sources),
             ));
-        } else if should_log_throttled(&format!("partial_auth:{key}"), 10_000) {
-            logger::warn(&format!(
+        } else {
+            log_warn!(
                 "found partial LCU auth but not enough to connect (client_dir={}, port={}, token={})",
                 group.dir.display(),
-                if has_port { "yes" } else { "no" },
-                if has_token { "yes" } else { "no" }
-            ));
+                if _has_port { "yes" } else { "no" },
+                if _has_token { "yes" } else { "no" }
+            );
         }
     }
 
