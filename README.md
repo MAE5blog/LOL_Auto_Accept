@@ -28,3 +28,12 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 3. 运行：`target\release\lol_plugin.exe`
 
 启动后会出现在系统托盘，右键菜单只有“退出”。
+
+## 发布 Releases（自动）
+
+仓库已配置 GitHub Actions：推送 tag 后会自动编译并把 exe 附到 Releases。
+
+示例：
+
+- `git tag v0.1.0`
+- `git push origin v0.1.0`
