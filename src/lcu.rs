@@ -88,7 +88,7 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
     }
 
     let mut accepted_this_ready_check = false;
-    let mut connection: Option<(LcuAuth, PathBuf)> = None;
+    let mut connection: Option<(LcuAuth, String)> = None;
     let mut last_phase: Option<String> = None;
 
     while !stop.load(Ordering::Relaxed) {
@@ -103,7 +103,7 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
             }
         }
 
-        let Some((auth, lockfile_path)) = connection.as_ref() else {
+        let Some((auth, source)) = connection.as_ref() else {
             continue;
         };
 
@@ -111,8 +111,7 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
             Ok(phase) => phase,
             Err(err) => {
                 logger::warn(&format!(
-                    "LCU request failed (lockfile={}): {err:?}",
-                    lockfile_path.display()
+                    "LCU request failed (source={source}): {err:?}"
                 ));
                 connection = None;
                 accepted_this_ready_check = false;
@@ -152,20 +151,24 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
 fn discover_connection(
     client: &reqwest::blocking::Client,
     overrides: &LcuOverrides,
-) -> Option<(LcuAuth, PathBuf)> {
+) -> Option<(LcuAuth, String)> {
+    for (auth, source) in running_league_auths_from_processes() {
+        if let Err(err) = probe_connection(client, &auth) {
+            logger::warn(&format!("process auth probe failed ({source}): {err:?}"));
+            continue;
+        }
+        logger::info(&format!(
+            "LCU connected via process (protocol={}, port={}, source={source})",
+            auth.protocol, auth.port
+        ));
+        return Some((auth, source));
+    }
+
     let mut paths = running_league_lockfile_paths();
     paths.extend(candidate_lockfile_paths(overrides));
 
     let mut seen = HashSet::<String>::new();
-    let mut deduped = Vec::new();
-    for path in paths {
-        let key = path_key(&path);
-        if seen.insert(key) {
-            deduped.push(path);
-        }
-    }
-
-    for path in deduped {
+    for path in paths.into_iter().filter(|p| seen.insert(path_key(p))) {
         let contents = match fs::read_to_string(&path) {
             Ok(contents) => contents,
             Err(_) => continue,
@@ -197,7 +200,7 @@ fn discover_connection(
             auth.port,
             path.display()
         ));
-        return Some((auth, path));
+        return Some((auth, format!("lockfile={}", path.display())));
     }
 
     None
@@ -453,7 +456,12 @@ fn running_league_lockfile_paths() -> Vec<PathBuf> {
                         let path = String::from_utf16_lossy(&buffer[..len as usize]);
                         let path = PathBuf::from(path);
                         if let Some(dir) = path.parent() {
-                            results.push(dir.join("lockfile"));
+                            let mut current = Some(dir);
+                            for _ in 0..4 {
+                                let Some(dir) = current else { break };
+                                results.push(dir.join("lockfile"));
+                                current = dir.parent();
+                            }
                         }
                     }
 
@@ -481,6 +489,251 @@ fn is_league_client_process(exe_name: &str) -> bool {
     exe_name.eq_ignore_ascii_case("LeagueClientUx.exe")
         || exe_name.eq_ignore_ascii_case("LeagueClientUxRender.exe")
         || exe_name.eq_ignore_ascii_case("LeagueClient.exe")
+}
+
+fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
+    use core::ffi::c_void;
+
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        System::{
+            Diagnostics::{
+                Debug::ReadProcessMemory,
+                ToolHelp::{
+                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+                    TH32CS_SNAPPROCESS,
+                },
+            },
+            Threading::{
+                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+            },
+        },
+    };
+
+    use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessBasicInfo {
+        exit_status: i32,
+        peb_base_address: *mut c_void,
+        affinity_mask: usize,
+        base_priority: i32,
+        unique_process_id: usize,
+        inherited_from_unique_process_id: usize,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct RtlUserProcessParameters {
+        reserved1: [u8; 16],
+        reserved2: [*mut c_void; 10],
+        _image_path_name: UnicodeString,
+        command_line: UnicodeString,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Peb {
+        reserved1: [u8; 2],
+        being_debugged: u8,
+        reserved2: u8,
+        reserved3: [*mut c_void; 2],
+        _ldr: *mut c_void,
+        process_parameters: *mut RtlUserProcessParameters,
+    }
+
+    unsafe fn read_command_line(
+        process: windows::Win32::Foundation::HANDLE,
+    ) -> anyhow::Result<String> {
+        let mut info = ProcessBasicInfo::default();
+        let mut return_len = 0u32;
+
+        let status = NtQueryInformationProcess(
+            process,
+            ProcessBasicInformation,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<ProcessBasicInfo>() as u32,
+            &mut return_len,
+        );
+
+        if status.0 < 0 {
+            anyhow::bail!("NtQueryInformationProcess failed: {status:?}");
+        }
+
+        if info.peb_base_address.is_null() {
+            anyhow::bail!("peb_base_address is null");
+        }
+
+        let mut peb = Peb::default();
+        ReadProcessMemory(
+            process,
+            info.peb_base_address as *const c_void,
+            &mut peb as *mut _ as *mut c_void,
+            std::mem::size_of::<Peb>(),
+            None,
+        )
+        .context("ReadProcessMemory(PEB)")?;
+
+        if peb.process_parameters.is_null() {
+            anyhow::bail!("process_parameters is null");
+        }
+
+        let mut params = RtlUserProcessParameters::default();
+        ReadProcessMemory(
+            process,
+            peb.process_parameters as *const c_void,
+            &mut params as *mut _ as *mut c_void,
+            std::mem::size_of::<RtlUserProcessParameters>(),
+            None,
+        )
+        .context("ReadProcessMemory(ProcessParameters)")?;
+
+        let cmd = params.command_line;
+        if cmd.length == 0 || cmd.buffer.is_null() {
+            anyhow::bail!("command line is empty");
+        }
+
+        let len_u16 = (cmd.length as usize) / 2;
+        let mut buffer = vec![0u16; len_u16];
+        ReadProcessMemory(
+            process,
+            cmd.buffer as *const c_void,
+            buffer.as_mut_ptr() as *mut c_void,
+            cmd.length as usize,
+            None,
+        )
+        .context("ReadProcessMemory(CommandLine)")?;
+
+        Ok(String::from_utf16_lossy(&buffer))
+    }
+
+    fn parse_auth_from_command_line(cmd: &str) -> Option<LcuAuth> {
+        let mut port: Option<u16> = None;
+        let mut password: Option<String> = None;
+        let mut protocol: Option<String> = None;
+
+        let args: Vec<&str> = cmd.split_whitespace().collect();
+        for i in 0..args.len() {
+            let arg = args[i];
+
+            if let Some(value) = arg.strip_prefix("--app-port=") {
+                port = value.trim_matches('"').parse().ok();
+            } else if arg == "--app-port" {
+                if let Some(value) = args.get(i + 1) {
+                    port = value.trim_matches('"').parse().ok();
+                }
+            }
+
+            if let Some(value) = arg.strip_prefix("--remoting-auth-token=") {
+                let value = value.trim_matches('"');
+                if !value.is_empty() {
+                    password = Some(value.to_string());
+                }
+            } else if arg == "--remoting-auth-token" {
+                if let Some(value) = args.get(i + 1) {
+                    let value = value.trim_matches('"');
+                    if !value.is_empty() {
+                        password = Some(value.to_string());
+                    }
+                }
+            }
+
+            if let Some(value) = arg.strip_prefix("--app-protocol=") {
+                let value = value.trim_matches('"').to_ascii_lowercase();
+                if value == "http" || value == "https" {
+                    protocol = Some(value);
+                }
+            }
+        }
+
+        Some(LcuAuth {
+            protocol: protocol.unwrap_or_else(|| "https".to_string()),
+            port: port?,
+            password: password?,
+        })
+    }
+
+    let mut results = Vec::new();
+
+    unsafe {
+        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return results,
+        };
+
+        let mut entry = PROCESSENTRY32W::default();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+
+        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
+        while ok {
+            let exe_name = utf16_nul_terminated_to_string(&entry.szExeFile);
+            if !exe_name.eq_ignore_ascii_case("LeagueClientUx.exe") {
+                ok = Process32NextW(snapshot, &mut entry).is_ok();
+                continue;
+            }
+
+            let pid = entry.th32ProcessID;
+
+            if let Ok(process) = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                false,
+                pid,
+            ) {
+                let mut exe_buf = vec![0u16; 32 * 1024];
+                let mut exe_len: u32 = exe_buf.len().try_into().unwrap_or(u32::MAX);
+                let exe_path = if QueryFullProcessImageNameW(
+                    process,
+                    PROCESS_NAME_FORMAT(0),
+                    windows::core::PWSTR(exe_buf.as_mut_ptr()),
+                    &mut exe_len,
+                )
+                .is_ok()
+                {
+                    Some(PathBuf::from(String::from_utf16_lossy(
+                        &exe_buf[..exe_len as usize],
+                    )))
+                } else {
+                    None
+                };
+
+                match read_command_line(process) {
+                    Ok(cmd) => {
+                        if let Some(auth) = parse_auth_from_command_line(&cmd) {
+                            let source = if let Some(exe_path) = exe_path {
+                                format!("pid={pid}, exe={}", exe_path.display())
+                            } else {
+                                format!("pid={pid}")
+                            };
+                            results.push((auth, source));
+                        }
+                    }
+                    Err(err) => {
+                        logger::warn(&format!(
+                            "failed to read command line for LeagueClientUx.exe (pid={pid}): {err:?}"
+                        ));
+                    }
+                }
+
+                let _ = CloseHandle(process);
+            }
+
+            ok = Process32NextW(snapshot, &mut entry).is_ok();
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+
+    results
 }
 
 fn riot_installed_league_dirs() -> Vec<PathBuf> {
