@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -234,19 +235,24 @@ fn riot_installed_league_dirs() -> Vec<PathBuf> {
     };
 
     let mut results = Vec::new();
-    for (key, value) in map {
-        if !key.starts_with("league_of_legends") {
-            continue;
-        }
-        let Some(path) = value.as_str() else {
-            continue;
-        };
-        let Some(path) = normalize_league_install_path(PathBuf::from(path)) else {
-            continue;
-        };
+    let mut seen = HashSet::<String>::new();
 
-        if !results.iter().any(|p: &PathBuf| p == &path) {
-            results.push(path);
+    for (key, value) in map.iter() {
+        if key.starts_with("league_of_legends") {
+            let Some(path) = value.as_str() else {
+                continue;
+            };
+            if let Some(path) = normalize_league_install_path(PathBuf::from(path)) {
+                push_dedup(&mut results, &mut seen, path);
+            }
+        }
+    }
+
+    if let Some(serde_json::Value::Object(associated)) = map.get("associated_client") {
+        for (install_dir, _client_path) in associated {
+            if let Some(path) = normalize_league_install_path(PathBuf::from(install_dir)) {
+                push_dedup(&mut results, &mut seen, path);
+            }
         }
     }
 
@@ -266,6 +272,22 @@ fn normalize_league_install_path(path: PathBuf) -> Option<PathBuf> {
     }
 
     None
+}
+
+fn push_dedup(results: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
+    let key = path_key(&path);
+    if seen.insert(key) {
+        results.push(path);
+    }
+}
+
+fn path_key(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    while key.ends_with('/') {
+        key.pop();
+    }
+    key.make_ascii_lowercase();
+    key
 }
 
 fn print_help() {
