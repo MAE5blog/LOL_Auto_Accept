@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -13,7 +12,6 @@ use anyhow::Context;
 
 #[derive(Clone, Default)]
 pub struct LcuOverrides {
-    lockfile: Option<PathBuf>,
     lol_dir: Option<PathBuf>,
 }
 
@@ -24,10 +22,6 @@ impl LcuOverrides {
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--lockfile" => {
-                    let value = args.next().context("missing value for --lockfile")?;
-                    overrides.lockfile = Some(PathBuf::from(value));
-                }
                 "--lol-dir" => {
                     let value = args.next().context("missing value for --lol-dir")?;
                     overrides.lol_dir = Some(PathBuf::from(value));
@@ -125,7 +119,8 @@ fn discover_connection(
     client: &reqwest::blocking::Client,
     overrides: &LcuOverrides,
 ) -> Option<(LcuAuth, String)> {
-    for (auth, source) in running_league_auths_from_processes() {
+    let filter = desired_client_dir_filter(overrides);
+    for (auth, source) in running_league_auths_from_processes(filter.as_ref()) {
         if let Err(_err) = probe_connection(client, &auth) {
             log_warn!("process auth probe failed ({source}): {_err:?}");
             continue;
@@ -136,45 +131,6 @@ fn discover_connection(
             auth.port
         );
         return Some((auth, source));
-    }
-
-    let mut paths = running_league_lockfile_paths();
-    paths.extend(candidate_lockfile_paths(overrides));
-
-    let mut seen = HashSet::<String>::new();
-    for path in paths.into_iter().filter(|p| seen.insert(path_key(p))) {
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(_) => continue,
-        };
-
-        let auth = match parse_lockfile(&contents) {
-            Some(auth) => auth,
-            None => {
-                log_warn!(
-                    "invalid lockfile format: {} ({})",
-                    path.display(),
-                    lockfile_debug_summary(&contents)
-                );
-                continue;
-            }
-        };
-
-        if let Err(_err) = probe_connection(client, &auth) {
-            log_warn!(
-                "lockfile found but probe failed ({}): {_err:?}",
-                path.display()
-            );
-            continue;
-        }
-
-        log_info!(
-            "LCU connected (protocol={}, port={}, lockfile={})",
-            auth.protocol,
-            auth.port,
-            path.display()
-        );
-        return Some((auth, format!("lockfile={}", path.display())));
     }
 
     None
@@ -263,198 +219,6 @@ fn accept_ready_check(client: &reqwest::blocking::Client, auth: &LcuAuth) -> any
     }
 }
 
-fn parse_lockfile(contents: &str) -> Option<LcuAuth> {
-    let mut contents = contents.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}');
-    contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
-    if contents.is_empty() {
-        return None;
-    }
-
-    let parts: Vec<&str> = contents.split(':').collect();
-    if parts.len() < 4 {
-        return None;
-    }
-
-    let (port_str, password_str, protocol_str) = if parts.len() >= 5 {
-        (
-            parts[parts.len() - 3],
-            parts[parts.len() - 2],
-            parts[parts.len() - 1],
-        )
-    } else {
-        (parts[1], parts[2], parts[3])
-    };
-
-    let port: u16 = port_str.trim().parse().ok()?;
-    if port == 0 {
-        return None;
-    }
-
-    let password = password_str.trim().to_string();
-    if password.is_empty() {
-        return None;
-    }
-
-    let protocol = protocol_str.trim().to_ascii_lowercase();
-    if protocol != "https" && protocol != "http" {
-        return None;
-    }
-
-    Some(LcuAuth {
-        protocol,
-        port,
-        password,
-    })
-}
-
-#[cfg(feature = "console")]
-fn lockfile_debug_summary(contents: &str) -> String {
-    let mut contents = contents.trim_matches(|c: char| c.is_whitespace() || c == '\u{0}');
-    contents = contents.strip_prefix('\u{feff}').unwrap_or(contents);
-
-    let len = contents.len();
-    let colons = contents.as_bytes().iter().filter(|&&b| b == b':').count();
-    let parts: Vec<&str> = contents.split(':').collect();
-
-    let first = parts.first().map(|p| p.trim()).unwrap_or("<empty>");
-    let first = if first.chars().count() > 32 {
-        let prefix: String = first.chars().take(32).collect();
-        format!("{prefix}...")
-    } else {
-        first.to_string()
-    };
-
-    let last = parts
-        .last()
-        .map(|p| p.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    let last = if last == "http" || last == "https" {
-        last
-    } else {
-        "<redacted>".to_string()
-    };
-
-    let mut nums = Vec::new();
-    for (idx, part) in parts.iter().enumerate() {
-        if let Ok(v) = part.trim().parse::<u32>() {
-            nums.push(format!("{idx}={v}"));
-        }
-    }
-
-    format!(
-        "len={len}, colons={colons}, parts={}, first=\"{first}\", last=\"{last}\", nums=[{}]",
-        parts.len(),
-        nums.join(",")
-    )
-}
-
-fn candidate_lockfile_paths(overrides: &LcuOverrides) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    if let Some(lockfile) = overrides.lockfile.clone() {
-        paths.push(lockfile);
-    }
-
-    if let Some(dir) = overrides.lol_dir.clone() {
-        paths.push(dir.join("lockfile"));
-    }
-
-    if let Some(lockfile) = std::env::var_os("LOL_LOCKFILE") {
-        paths.push(PathBuf::from(lockfile));
-    }
-
-    if let Some(dir) = std::env::var_os("LOL_DIR") {
-        paths.push(PathBuf::from(dir).join("lockfile"));
-    }
-
-    for riot_dir in riot_installed_league_dirs() {
-        paths.push(riot_dir.join("lockfile"));
-    }
-
-    for base in [
-        r"C:\Riot Games\League of Legends",
-        r"C:\Program Files\Riot Games\League of Legends",
-        r"C:\Program Files (x86)\Riot Games\League of Legends",
-    ] {
-        paths.push(PathBuf::from(base).join("lockfile"));
-    }
-
-    paths
-}
-
-fn running_league_lockfile_paths() -> Vec<PathBuf> {
-    use windows::Win32::{
-        Foundation::CloseHandle,
-        System::{
-            Diagnostics::ToolHelp::{
-                CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-                TH32CS_SNAPPROCESS,
-            },
-            Threading::{
-                OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
-                PROCESS_QUERY_LIMITED_INFORMATION,
-            },
-        },
-    };
-
-    let mut results = Vec::new();
-
-    unsafe {
-        let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
-            Ok(snapshot) => snapshot,
-            Err(_) => return Vec::new(),
-        };
-
-        let mut entry = PROCESSENTRY32W::default();
-        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-        let mut ok = Process32FirstW(snapshot, &mut entry).is_ok();
-        while ok {
-            let exe_name = utf16_nul_terminated_to_string(&entry.szExeFile);
-
-            if is_league_client_process(&exe_name) {
-                let pid = entry.th32ProcessID;
-
-                if let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                    let mut buffer = vec![0u16; 32 * 1024];
-                    let mut len: u32 = buffer.len().try_into().unwrap_or(u32::MAX);
-
-                    let ok = QueryFullProcessImageNameW(
-                        process,
-                        PROCESS_NAME_FORMAT(0),
-                        windows::core::PWSTR(buffer.as_mut_ptr()),
-                        &mut len,
-                    )
-                    .is_ok();
-
-                    if ok {
-                        let path = String::from_utf16_lossy(&buffer[..len as usize]);
-                        let path = PathBuf::from(path);
-                        if let Some(dir) = path.parent() {
-                            let mut current = Some(dir);
-                            for _ in 0..4 {
-                                let Some(dir) = current else { break };
-                                results.push(dir.join("lockfile"));
-                                current = dir.parent();
-                            }
-                        }
-                    }
-
-                    let _ = CloseHandle(process);
-                }
-            }
-
-            ok = Process32NextW(snapshot, &mut entry).is_ok();
-        }
-
-        let _ = CloseHandle(snapshot);
-    }
-
-    let mut seen = HashSet::<String>::new();
-    results.retain(|path| seen.insert(path_key(path)));
-    results
-}
-
 fn utf16_nul_terminated_to_string(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..len])
@@ -466,7 +230,7 @@ fn is_league_client_process(exe_name: &str) -> bool {
         || exe_name.eq_ignore_ascii_case("LeagueClient.exe")
 }
 
-fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
+fn running_league_auths_from_processes(filter: Option<&ClientDirFilter>) -> Vec<(LcuAuth, String)> {
     use core::ffi::c_void;
 
     use windows::Win32::{
@@ -937,7 +701,13 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
     }
 
     let mut results = Vec::new();
-    for (_key, group) in groups {
+    for (key, group) in groups {
+        if let Some(filter) = filter {
+            if !filter.matches_key(&key) {
+                continue;
+            }
+        }
+
         let partial = group.partial.clone();
         let _has_port = partial.port.is_some();
         let _has_token = partial.password.is_some();
@@ -965,74 +735,6 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
     results
 }
 
-fn riot_installed_league_dirs() -> Vec<PathBuf> {
-    let Some(programdata) = std::env::var_os("PROGRAMDATA") else {
-        return Vec::new();
-    };
-
-    let installs_path = PathBuf::from(programdata)
-        .join("Riot Games")
-        .join("RiotClientInstalls.json");
-
-    let Ok(contents) = fs::read_to_string(installs_path) else {
-        return Vec::new();
-    };
-
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return Vec::new();
-    };
-
-    let serde_json::Value::Object(map) = json else {
-        return Vec::new();
-    };
-
-    let mut results = Vec::new();
-    let mut seen = HashSet::<String>::new();
-
-    for (key, value) in map.iter() {
-        if key.starts_with("league_of_legends") {
-            let Some(path) = value.as_str() else {
-                continue;
-            };
-            if let Some(path) = normalize_league_install_path(PathBuf::from(path)) {
-                push_dedup(&mut results, &mut seen, path);
-            }
-        }
-    }
-
-    if let Some(serde_json::Value::Object(associated)) = map.get("associated_client") {
-        for (install_dir, _client_path) in associated {
-            if let Some(path) = normalize_league_install_path(PathBuf::from(install_dir)) {
-                push_dedup(&mut results, &mut seen, path);
-            }
-        }
-    }
-
-    results
-}
-
-fn normalize_league_install_path(path: PathBuf) -> Option<PathBuf> {
-    if path.is_dir() {
-        return Some(path);
-    }
-
-    if path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-    {
-        return path.parent().map(PathBuf::from);
-    }
-
-    None
-}
-
-fn push_dedup(results: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf) {
-    let key = path_key(&path);
-    if seen.insert(key) {
-        results.push(path);
-    }
-}
-
 fn path_key(path: &Path) -> String {
     let mut key = path.to_string_lossy().replace('\\', "/");
     while key.ends_with('/') {
@@ -1042,8 +744,38 @@ fn path_key(path: &Path) -> String {
     key
 }
 
+#[derive(Clone)]
+struct ClientDirFilter {
+    exact: String,
+    prefix: String,
+}
+
+impl ClientDirFilter {
+    fn new(path: &Path) -> Self {
+        let exact = path_key(path);
+        let prefix = format!("{exact}/");
+        Self { exact, prefix }
+    }
+
+    fn matches_key(&self, key: &str) -> bool {
+        key == self.exact || key.starts_with(&self.prefix)
+    }
+}
+
+fn desired_client_dir_filter(overrides: &LcuOverrides) -> Option<ClientDirFilter> {
+    if let Some(dir) = overrides.lol_dir.as_deref() {
+        return Some(ClientDirFilter::new(dir));
+    }
+
+    if let Some(dir) = std::env::var_os("LOL_DIR") {
+        return Some(ClientDirFilter::new(Path::new(&dir)));
+    }
+
+    None
+}
+
 fn print_help() {
     println!(
-        "lol_plugin (Windows)\n\nUSAGE:\n  lol_plugin.exe [--lol-dir <path>] [--lockfile <path>]\n\nOPTIONS:\n  --lol-dir <path>   League of Legends install directory (contains LeagueClient.exe)\n  --lockfile <path>  Full path to the LCU lockfile\n  -h, --help, /?     Print this help\n\nNOTES:\n  You can also set env vars LOL_DIR or LOL_LOCKFILE.\n  The lockfile exists only while the League client is running."
+        "lol_plugin (Windows)\n\nUSAGE:\n  lol_plugin.exe [--lol-dir <path>]\n\nOPTIONS:\n  --lol-dir <path>   Filter which running client to use (useful when multiple clients are running)\n  -h, --help, /?     Print this help\n\nNOTES:\n  This program connects to LCU only via running League client processes.\n  If the client is not running, it retries every 1 second.\n  You can also set env var LOL_DIR."
     );
 }

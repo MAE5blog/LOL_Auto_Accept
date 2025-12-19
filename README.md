@@ -4,7 +4,7 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 
 ## 运行原理
 
-- 从本机 `lockfile`（或 `RiotClientInstalls.json` 推导的安装目录）读取 LCU 的 `port`/`token`
+- 从正在运行的 LOL 客户端进程命令行读取 LCU 的 `port`/`token`（`--app-port` / `--remoting-auth-token`）
 - 轮询 `GET /lol-gameflow/v1/gameflow-phase`
 - 当进入 `ReadyCheck` 时调用 `POST /lol-matchmaking/v1/ready-check/accept`
 
@@ -12,22 +12,14 @@ Win 平台托盘常驻的 LOL LCU ReadyCheck 自动接受工具（仅个人使�
 
 - 托盘常驻，右键菜单只有“退出”
 - 默认不输出日志、不生成日志文件
+- 仅在客户端运行后才能连接 LCU；如果未检测到客户端，会每 1 秒重试一次
 
 ## 配置（可选）
 
-默认会尝试从 `C:\ProgramData\Riot Games\RiotClientInstalls.json` 和常见安装路径定位 `lockfile`。
+如果你电脑上同时运行了多个服/多个客户端，可用参数或环境变量“指定要监听的那个目录”：
 
-如果你电脑上装了多个服/多个客户端，建议用参数或环境变量“指定要监听的那个安装目录”，避免定位到另一个客户端。
-
-如果你的安装路径比较特殊，可用环境变量指定：
-
-- `LOL_LOCKFILE`：直接指定 `lockfile` 完整路径
-- `LOL_DIR`：指定 LoL 安装目录（程序会自动拼接 `lockfile`）
-
-也可以用命令行参数（更适合做快捷方式）：
-
-- `--lockfile <path>`
-- `--lol-dir <path>`
+- `LOL_DIR`：过滤目标客户端目录（用于多开时指定）
+- `--lol-dir <path>`：同上（更适合做快捷方式）
 
 ## 构建（Windows）
 
