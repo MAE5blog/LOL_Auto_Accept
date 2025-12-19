@@ -463,7 +463,7 @@ fn running_league_lockfile_paths() -> Vec<PathBuf> {
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(snapshot) => snapshot,
-            Err(_) => return results,
+            Err(_) => return Vec::new(),
         };
 
         let mut entry = PROCESSENTRY32W::default();
@@ -591,6 +591,60 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         reserved3: [*mut c_void; 2],
         _ldr: *mut c_void,
         process_parameters: *mut RtlUserProcessParameters,
+    }
+
+    #[derive(Default, Clone)]
+    struct PartialAuth {
+        protocol: Option<String>,
+        port: Option<u16>,
+        password: Option<String>,
+    }
+
+    impl PartialAuth {
+        fn merge(&mut self, other: PartialAuth, key: &str) {
+            if self.protocol.is_none() {
+                self.protocol = other.protocol;
+            } else if let (Some(a), Some(b)) = (self.protocol.as_ref(), other.protocol.as_ref()) {
+                if a != b && should_log_throttled(&format!("auth_conflict:{key}:protocol"), 10_000)
+                {
+                    logger::warn(&format!(
+                        "conflicting LCU protocol for same client dir ({key}): {a} vs {b}"
+                    ));
+                }
+            }
+
+            if self.port.is_none() {
+                self.port = other.port;
+            } else if let (Some(a), Some(b)) = (self.port, other.port) {
+                if a != b && should_log_throttled(&format!("auth_conflict:{key}:port"), 10_000) {
+                    logger::warn(&format!(
+                        "conflicting LCU port for same client dir ({key}): {a} vs {b}"
+                    ));
+                }
+            }
+
+            if self.password.is_none() {
+                self.password = other.password;
+            } else if let (Some(a), Some(b)) = (self.password.as_ref(), other.password.as_ref()) {
+                if a != b && should_log_throttled(&format!("auth_conflict:{key}:token"), 10_000) {
+                    logger::warn(&format!(
+                        "conflicting LCU remoting-auth-token for same client dir ({key})"
+                    ));
+                }
+            }
+        }
+
+        fn into_auth(self) -> Option<LcuAuth> {
+            let port = self.port?;
+            let password = self.password?;
+            let protocol = self.protocol.unwrap_or_else(|| "https".to_string());
+
+            Some(LcuAuth {
+                protocol,
+                port,
+                password,
+            })
+        }
     }
 
     unsafe fn read_command_line_ntquery(
@@ -723,65 +777,100 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         Ok(String::from_utf16_lossy(&buffer))
     }
 
-    fn parse_auth_from_command_line(cmd: &str) -> Result<LcuAuth, String> {
-        let mut port: Option<u16> = None;
-        let mut password: Option<String> = None;
-        let mut protocol: Option<String> = None;
+    fn find_cmd_arg_value(cmd: &str, name: &str) -> Option<String> {
+        let bytes = cmd.as_bytes();
+        let mut start = 0usize;
+        let mut best: Option<String> = None;
 
-        let args: Vec<&str> = cmd.split_whitespace().collect();
-        for i in 0..args.len() {
-            let arg = args[i];
+        while start < cmd.len() {
+            let Some(rel) = cmd[start..].find(name) else {
+                break;
+            };
+            let idx = start + rel;
 
-            if let Some(value) = arg.strip_prefix("--app-port=") {
-                port = value.trim_matches('"').parse().ok();
-            } else if arg == "--app-port" {
-                if let Some(value) = args.get(i + 1) {
-                    port = value.trim_matches('"').parse().ok();
+            if idx > 0 {
+                let prev = bytes[idx - 1];
+                if !prev.is_ascii_whitespace() && prev != b'"' && prev != b'\'' {
+                    start = idx + name.len();
+                    continue;
                 }
             }
 
-            if let Some(value) = arg.strip_prefix("--remoting-auth-token=") {
-                let value = value.trim_matches('"');
-                if !value.is_empty() {
-                    password = Some(value.to_string());
+            let mut j = idx + name.len();
+            if bytes.get(j) == Some(&b'=') {
+                j += 1;
+            } else {
+                while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+                    j += 1;
                 }
-            } else if arg == "--remoting-auth-token" {
-                if let Some(value) = args.get(i + 1) {
-                    let value = value.trim_matches('"');
-                    if !value.is_empty() {
-                        password = Some(value.to_string());
+            }
+
+            if j >= cmd.len() {
+                start = idx + name.len();
+                continue;
+            }
+
+            let quote = bytes[j];
+            let (val, end) = if quote == b'"' || quote == b'\'' {
+                j += 1;
+                let mut k = j;
+                while k < cmd.len() && bytes[k] != quote {
+                    k += 1;
+                }
+                (&cmd[j..k], k.saturating_add(1))
+            } else {
+                let mut k = j;
+                while k < cmd.len() {
+                    let b = bytes[k];
+                    if b.is_ascii_whitespace() || b == b'"' || b == b'\'' {
+                        break;
                     }
+                    k += 1;
                 }
-            }
+                (&cmd[j..k], k)
+            };
 
-            if let Some(value) = arg.strip_prefix("--app-protocol=") {
-                let value = value.trim_matches('"').to_ascii_lowercase();
-                if value == "http" || value == "https" {
-                    protocol = Some(value);
-                }
+            if !val.is_empty() {
+                best = Some(val.to_string());
             }
+            start = end.max(idx + name.len());
         }
 
-        let port = port.ok_or_else(|| "missing --app-port".to_string())?;
-        if port == 0 {
-            return Err("invalid --app-port=0".to_string());
-        }
-
-        let password = password.ok_or_else(|| "missing --remoting-auth-token".to_string())?;
-
-        Ok(LcuAuth {
-            protocol: protocol.unwrap_or_else(|| "https".to_string()),
-            port,
-            password,
-        })
+        best
     }
 
-    let mut results = Vec::new();
+    fn parse_partial_auth_from_command_line(cmd: &str) -> PartialAuth {
+        let protocol = find_cmd_arg_value(cmd, "--app-protocol")
+            .map(|s| s.trim_matches('"').to_ascii_lowercase())
+            .filter(|s| s == "http" || s == "https");
+
+        let port = find_cmd_arg_value(cmd, "--app-port")
+            .and_then(|s| s.trim_matches('"').parse::<u16>().ok())
+            .filter(|&p| p != 0);
+
+        let password = find_cmd_arg_value(cmd, "--remoting-auth-token")
+            .map(|s| s.trim_matches('"').to_string())
+            .filter(|s| !s.is_empty());
+
+        PartialAuth {
+            protocol,
+            port,
+            password,
+        }
+    }
+
+    struct Group {
+        dir: PathBuf,
+        partial: PartialAuth,
+        sources: Vec<String>,
+    }
+
+    let mut groups: HashMap<String, Group> = HashMap::new();
 
     unsafe {
         let snapshot = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             Ok(snapshot) => snapshot,
-            Err(_) => return results,
+            Err(_) => return Vec::new(),
         };
 
         let mut entry = PROCESSENTRY32W::default();
@@ -827,34 +916,52 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                 None
             };
 
-            let source_base = if let Some(exe_path) = exe_path.as_ref() {
-                format!("pid={pid}, exe_name={exe_name}, exe={}", exe_path.display())
-            } else {
-                format!("pid={pid}, exe_name={exe_name}")
+            let Some(exe_path) = exe_path else {
+                let _ = CloseHandle(process);
+                ok = Process32NextW(snapshot, &mut entry).is_ok();
+                continue;
             };
 
-            let cmd = match read_command_line_ntquery(process) {
-                Ok(cmd) => Some(cmd),
+            let Some(exe_dir) = exe_path.parent() else {
+                let _ = CloseHandle(process);
+                ok = Process32NextW(snapshot, &mut entry).is_ok();
+                continue;
+            };
+
+            let client_dir_key = path_key(exe_dir);
+            let source_base = format!("pid={pid}, exe_name={exe_name}, exe={}", exe_path.display());
+
+            let (cmd, cmd_source) = match read_command_line_ntquery(process) {
+                Ok(cmd) => (Some(cmd), "cmdline_ntq"),
                 Err(err) => {
                     if should_log_throttled(&format!("cmdline_ntq:{pid}"), 10_000) {
                         logger::warn(&format!(
                             "failed to read command line (NtQuery) ({source_base}): {err:?}"
                         ));
                     }
-                    None
+                    (None, "cmdline_ntq")
                 }
             };
 
             if let Some(cmd) = cmd {
-                match parse_auth_from_command_line(&cmd) {
-                    Ok(auth) => results.push((auth, format!("{source_base}, via=cmdline_ntq"))),
-                    Err(reason) => {
-                        if should_log_throttled(&format!("cmdline_parse:{pid}"), 10_000) {
-                            logger::warn(&format!(
-                                "process command line missing LCU args ({source_base}): {reason}"
-                            ));
-                        }
-                    }
+                let partial = parse_partial_auth_from_command_line(&cmd);
+                let has_any = partial.port.is_some() || partial.password.is_some();
+                if has_any {
+                    let entry = groups
+                        .entry(client_dir_key.clone())
+                        .or_insert_with(|| Group {
+                            dir: exe_dir.to_path_buf(),
+                            partial: PartialAuth::default(),
+                            sources: Vec::new(),
+                        });
+                    entry
+                        .sources
+                        .push(format!("{source_base}, via={cmd_source}"));
+                    entry.partial.merge(partial, &client_dir_key);
+                } else if should_log_throttled(&format!("cmdline_no_lcu:{pid}"), 10_000) {
+                    logger::warn(&format!(
+                        "process command line has no LCU args ({source_base})"
+                    ));
                 }
             } else {
                 let process_vm = match OpenProcess(
@@ -876,16 +983,29 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
                 };
 
                 match read_command_line_peb(process_vm) {
-                    Ok(cmd) => match parse_auth_from_command_line(&cmd) {
-                        Ok(auth) => results.push((auth, format!("{source_base}, via=cmdline_peb"))),
-                        Err(reason) => {
-                            if should_log_throttled(&format!("cmdline_peb_parse:{pid}"), 10_000) {
-                                logger::warn(&format!(
-                                    "process command line missing LCU args ({source_base}): {reason}"
-                                ));
-                            }
+                    Ok(cmd) => {
+                        let partial = parse_partial_auth_from_command_line(&cmd);
+                        let has_any = partial.port.is_some() || partial.password.is_some();
+                        if has_any {
+                            let entry =
+                                groups
+                                    .entry(client_dir_key.clone())
+                                    .or_insert_with(|| Group {
+                                        dir: exe_dir.to_path_buf(),
+                                        partial: PartialAuth::default(),
+                                        sources: Vec::new(),
+                                    });
+                            entry
+                                .sources
+                                .push(format!("{source_base}, via=cmdline_peb"));
+                            entry.partial.merge(partial, &client_dir_key);
+                        } else if should_log_throttled(&format!("cmdline_peb_no_lcu:{pid}"), 10_000)
+                        {
+                            logger::warn(&format!(
+                                "process command line has no LCU args ({source_base})"
+                            ));
                         }
-                    },
+                    }
                     Err(err) => {
                         if should_log_throttled(&format!("cmdline_peb:{pid}"), 10_000) {
                             logger::warn(&format!(
@@ -903,6 +1023,32 @@ fn running_league_auths_from_processes() -> Vec<(LcuAuth, String)> {
         }
 
         let _ = CloseHandle(snapshot);
+    }
+
+    let mut results = Vec::new();
+    for (key, group) in groups {
+        let partial = group.partial.clone();
+        let has_port = partial.port.is_some();
+        let has_token = partial.password.is_some();
+
+        if let Some(auth) = partial.into_auth() {
+            let sources = if group.sources.is_empty() {
+                "unknown".to_string()
+            } else {
+                group.sources.join(" | ")
+            };
+            results.push((
+                auth,
+                format!("client_dir={}, sources={}", group.dir.display(), sources),
+            ));
+        } else if should_log_throttled(&format!("partial_auth:{key}"), 10_000) {
+            logger::warn(&format!(
+                "found partial LCU auth but not enough to connect (client_dir={}, port={}, token={})",
+                group.dir.display(),
+                if has_port { "yes" } else { "no" },
+                if has_token { "yes" } else { "no" }
+            ));
+        }
     }
 
     results
