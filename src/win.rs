@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use windows::{
-    core::w,
+    core::{w, PCWSTR},
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         System::LibraryLoader::GetModuleHandleW,
@@ -30,6 +30,7 @@ static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 const WM_TRAYICON: u32 = WM_APP + 1;
 const TRAY_UID: u32 = 1;
 const ID_TRAY_EXIT: usize = 1001;
+const APP_ICON_ID: u16 = 1;
 
 pub fn run(overrides: crate::lcu::LcuOverrides) -> anyhow::Result<()> {
     log_info!("tray start");
@@ -58,9 +59,14 @@ pub fn run(overrides: crate::lcu::LcuOverrides) -> anyhow::Result<()> {
 unsafe fn init_tray() -> anyhow::Result<NOTIFYICONDATAW> {
     let hinstance = GetModuleHandleW(None)?;
 
+    let icon = LoadIconW(hinstance, PCWSTR(APP_ICON_ID as usize as *const u16))
+        .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+        .unwrap_or(HICON::default());
+
     let class_name = w!("lol_plugin.TrayWindow");
     let wc = WNDCLASSW {
         hInstance: hinstance.into(),
+        hIcon: icon,
         lpszClassName: class_name,
         lpfnWndProc: Some(wndproc),
         ..Default::default()
@@ -81,8 +87,6 @@ unsafe fn init_tray() -> anyhow::Result<NOTIFYICONDATAW> {
         hinstance,
         None,
     )?;
-
-    let icon = LoadIconW(None, IDI_APPLICATION).unwrap_or(HICON::default());
 
     let mut notify_data = NOTIFYICONDATAW::default();
     notify_data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
