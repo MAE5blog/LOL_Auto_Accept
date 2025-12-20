@@ -1,12 +1,12 @@
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+
+const MIN_GAME_TIME_SECS: f64 = 10.0;
 
 pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     log_info!("ingame fullmute: start");
@@ -34,8 +34,16 @@ pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Resul
                     );
                     #[cfg(not(any(feature = "console", feature = "logging")))]
                     log_info!("ingame fullmute: detected game foreground");
-                    std::thread::sleep(Duration::from_secs(1));
+                    std::thread::sleep(Duration::from_millis(750));
+                    #[cfg(any(feature = "console", feature = "logging"))]
+                    if let Ok(path) = capture_screen_bmp("fullmute_before") {
+                        log_info!("ingame fullmute: screenshot(before) {}", path.display());
+                    }
                     send_chat_command("/fullmute all").context("send /fullmute all")?;
+                    #[cfg(any(feature = "console", feature = "logging"))]
+                    if let Ok(path) = capture_screen_bmp("fullmute_after") {
+                        log_info!("ingame fullmute: screenshot(after) {}", path.display());
+                    }
                     log_info!("ingame fullmute: sent /fullmute all");
                     return Ok(());
                 }
@@ -83,18 +91,23 @@ fn wait_for_liveclient(
 ) -> anyhow::Result<bool> {
     let mut last_log = Instant::now() - Duration::from_secs(10);
     let mut last_err: Option<String> = None;
+    let mut last_time: Option<i64> = None;
 
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        match liveclient_activeplayername(client) {
-            Ok(Some(_name)) => {
+        match liveclient_game_time_seconds(client) {
+            Ok(Some(game_time)) if game_time >= MIN_GAME_TIME_SECS => {
                 #[cfg(any(feature = "console", feature = "logging"))]
                 log_info!(
-                    "ingame fullmute: liveclient ready (activeplayername={})",
-                    _name
+                    "ingame fullmute: liveclient ready (gameTime={:.1}s)",
+                    game_time
                 );
                 #[cfg(not(any(feature = "console", feature = "logging")))]
                 log_info!("ingame fullmute: liveclient ready");
                 return Ok(true);
+            }
+            Ok(Some(game_time)) => {
+                last_time = Some(game_time.floor() as i64);
+                last_err = None;
             }
             Ok(None) => {}
             Err(_err) => {
@@ -105,6 +118,11 @@ fn wait_for_liveclient(
         if last_log.elapsed() >= Duration::from_secs(3) {
             if let Some(_err) = last_err.as_deref() {
                 log_info!("ingame fullmute: waiting for liveclient... (last_err={_err})");
+            } else if let Some(_sec) = last_time {
+                log_info!(
+                    "ingame fullmute: waiting for game start... (gameTime={}s)",
+                    _sec
+                );
             } else {
                 log_info!("ingame fullmute: waiting for liveclient...");
             }
@@ -118,12 +136,10 @@ fn wait_for_liveclient(
     Ok(false)
 }
 
-fn liveclient_activeplayername(
-    client: &reqwest::blocking::Client,
-) -> anyhow::Result<Option<String>> {
-    let bases = ["https://127.0.0.1:2999", "http://127.0.0.1:2999"];
+fn liveclient_game_time_seconds(client: &reqwest::blocking::Client) -> anyhow::Result<Option<f64>> {
+    let bases = ["http://127.0.0.1:2999", "https://127.0.0.1:2999"];
     for base in bases {
-        let url = format!("{base}/liveclientdata/activeplayername");
+        let url = format!("{base}/liveclientdata/gamestats");
         let response = match client.get(&url).send() {
             Ok(r) => r,
             Err(_err) => continue,
@@ -134,19 +150,179 @@ fn liveclient_activeplayername(
         }
 
         let body = response.text().unwrap_or_default();
-        if let Ok(name) = serde_json::from_str::<String>(&body) {
-            if !name.trim().is_empty() {
-                return Ok(Some(name));
-            }
-        }
-
-        let name = body.trim().trim_matches('"').to_string();
-        if !name.is_empty() {
-            return Ok(Some(name));
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(_err) => continue,
+        };
+        let Some(game_time) = value.get("gameTime").and_then(|v| v.as_f64()) else {
+            continue;
+        };
+        if game_time.is_finite() && game_time >= 0.0 {
+            return Ok(Some(game_time));
         }
     }
 
     Ok(None)
+}
+
+#[cfg(any(feature = "console", feature = "logging"))]
+fn capture_screen_bmp(prefix: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::time::SystemTime;
+
+    use windows::Win32::{
+        Foundation::HWND,
+        Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+            GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+            DIB_RGB_COLORS, SRCCOPY,
+        },
+        UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN},
+    };
+
+    let out_dir = debug_output_dir();
+    let ts_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let path = out_dir.join(format!("{prefix}_{ts_ms}.bmp"));
+
+    unsafe {
+        let width = GetSystemMetrics(SM_CXSCREEN);
+        let height = GetSystemMetrics(SM_CYSCREEN);
+
+        if width <= 0 || height <= 0 {
+            anyhow::bail!("GetSystemMetrics returned invalid size: {width}x{height}");
+        }
+
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.0.is_null() {
+            anyhow::bail!("GetDC returned null");
+        }
+
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.0.is_null() {
+            let _ = ReleaseDC(HWND::default(), screen_dc);
+            anyhow::bail!("CreateCompatibleDC returned null");
+        }
+
+        let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
+        if bitmap.0.is_null() {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(HWND::default(), screen_dc);
+            anyhow::bail!("CreateCompatibleBitmap returned null");
+        }
+
+        let old = SelectObject(mem_dc, bitmap);
+        let ok = BitBlt(mem_dc, 0, 0, width, height, screen_dc, 0, 0, SRCCOPY).is_ok();
+        let _ = ReleaseDC(HWND::default(), screen_dc);
+
+        if !ok {
+            let _ = SelectObject(mem_dc, old);
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem_dc);
+            anyhow::bail!("BitBlt failed");
+        }
+
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: (width * height * 4) as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+
+        let pixel_bytes = (width * height * 4) as usize;
+        let mut pixels = vec![0u8; pixel_bytes];
+        let lines = GetDIBits(
+            mem_dc,
+            bitmap,
+            0,
+            height as u32,
+            Some(pixels.as_mut_ptr() as *mut _),
+            &mut info as *mut _,
+            DIB_RGB_COLORS,
+        );
+
+        let _ = SelectObject(mem_dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(mem_dc);
+
+        if lines == 0 {
+            anyhow::bail!("GetDIBits returned 0");
+        }
+
+        let _ = std::fs::create_dir_all(&out_dir);
+        let mut file = std::fs::File::create(&path).context("create bmp file")?;
+        write_bmp_32bpp(&mut file, width, height, &pixels).context("write bmp")?;
+
+        Ok(path)
+    }
+}
+
+#[cfg(any(feature = "console", feature = "logging"))]
+fn debug_output_dir() -> std::path::PathBuf {
+    crate::logger::log_path()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.to_path_buf()))
+        })
+        .unwrap_or_else(|| std::env::temp_dir())
+}
+
+#[cfg(any(feature = "console", feature = "logging"))]
+fn write_bmp_32bpp(
+    mut w: impl std::io::Write,
+    width: i32,
+    height: i32,
+    pixels_bgra: &[u8],
+) -> anyhow::Result<()> {
+    let width_u32: u32 = width.try_into().context("width to u32")?;
+    let height_u32: u32 = height.try_into().context("height to u32")?;
+    let header_size = 14u32 + 40u32;
+    let pixel_size = width_u32
+        .checked_mul(height_u32)
+        .and_then(|v| v.checked_mul(4))
+        .context("pixel size overflow")?;
+    let file_size = header_size
+        .checked_add(pixel_size)
+        .context("file size overflow")?;
+    if pixels_bgra.len() != pixel_size as usize {
+        anyhow::bail!(
+            "unexpected pixel buffer size: got {}, expected {}",
+            pixels_bgra.len(),
+            pixel_size
+        );
+    }
+
+    w.write_all(b"BM")?;
+    w.write_all(&file_size.to_le_bytes())?;
+    w.write_all(&0u16.to_le_bytes())?;
+    w.write_all(&0u16.to_le_bytes())?;
+    w.write_all(&header_size.to_le_bytes())?;
+
+    w.write_all(&40u32.to_le_bytes())?;
+    w.write_all(&width.to_le_bytes())?;
+    w.write_all(&(-height).to_le_bytes())?;
+    w.write_all(&1u16.to_le_bytes())?;
+    w.write_all(&32u16.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?;
+    w.write_all(&pixel_size.to_le_bytes())?;
+    w.write_all(&0i32.to_le_bytes())?;
+    w.write_all(&0i32.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?;
+    w.write_all(&0u32.to_le_bytes())?;
+
+    w.write_all(pixels_bgra)?;
+    Ok(())
 }
 
 struct ForegroundProcessInfo {
@@ -216,10 +392,10 @@ fn send_chat_command(text: &str) -> anyhow::Result<()> {
 
     log_info!("ingame fullmute: send Enter");
     send_key(VK_RETURN)?;
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(350));
     log_info!("ingame fullmute: send text");
     send_text(text)?;
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(250));
     log_info!("ingame fullmute: send Enter");
     send_key(VK_RETURN)?;
     Ok(())
@@ -228,7 +404,7 @@ fn send_chat_command(text: &str) -> anyhow::Result<()> {
 fn send_text(text: &str) -> anyhow::Result<()> {
     for ch in text.chars() {
         send_char(ch)?;
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(Duration::from_millis(25));
     }
     Ok(())
 }
@@ -306,32 +482,10 @@ fn send_key(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> any
 fn send_key_press(
     vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
 ) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP;
-    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
-
-    if let Some(scan) = scancode_for_vk(vk) {
-        send_inputs(&[
-            keyboard_input(
-                windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-                scan,
-                KEYEVENTF_SCANCODE,
-            ),
-            keyboard_input(
-                windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-                scan,
-                KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
-            ),
-        ])
-    } else {
-        send_inputs(&[
-            keyboard_input(
-                vk,
-                0,
-                windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
-            ),
-            keyboard_input(vk, 0, KEYEVENTF_KEYUP),
-        ])
-    }
+    send_key_down(vk)?;
+    std::thread::sleep(Duration::from_millis(30));
+    send_key_up(vk)?;
+    Ok(())
 }
 
 fn send_key_down(
