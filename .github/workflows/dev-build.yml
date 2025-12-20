@@ -1,0 +1,38 @@
+name: Dev Build
+
+on:
+  push:
+    branches:
+      - dev
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $out = "lol_plugin-dev.exe"
+          Copy-Item "target/release/lol_plugin.exe" $out -Force
+          Get-FileHash $out -Algorithm SHA256 | Format-List
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lol_plugin-dev
+          path: lol_plugin-dev.exe
+          if-no-files-found: error
+
