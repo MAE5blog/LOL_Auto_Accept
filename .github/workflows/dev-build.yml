@@ -22,17 +22,33 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
-      - name: Package
+      - name: Package (silent)
         shell: pwsh
         run: |
           $out = "lol_plugin-dev.exe"
           Copy-Item "target/release/lol_plugin.exe" $out -Force
           Get-FileHash $out -Algorithm SHA256 | Format-List
 
-      - name: Upload Artifact
+      - name: Build (release, logging)
+        run: cargo build --release --features logging
+
+      - name: Package (debug logging)
+        shell: pwsh
+        run: |
+          $out = "lol_plugin-dev-debug.exe"
+          Copy-Item "target/release/lol_plugin.exe" $out -Force
+          Get-FileHash $out -Algorithm SHA256 | Format-List
+
+      - name: Upload Artifact (silent)
         uses: actions/upload-artifact@v4
         with:
           name: lol_plugin-dev
           path: lol_plugin-dev.exe
           if-no-files-found: error
 
+      - name: Upload Artifact (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lol_plugin-dev-debug
+          path: lol_plugin-dev-debug.exe
+          if-no-files-found: error

@@ -5,7 +5,8 @@ edition = "2021"
 
 [features]
 default = []
-console = []
+logging = []
+console = ["logging"]
 
 [dependencies]
 anyhow = "1"

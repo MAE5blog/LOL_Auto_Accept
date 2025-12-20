@@ -1,37 +1,37 @@
 #![cfg_attr(all(windows, not(feature = "console")), windows_subsystem = "windows")]
 
-#[cfg(feature = "console")]
+#[cfg(any(feature = "console", feature = "logging"))]
 macro_rules! log_info {
     ($($arg:tt)*) => {
         crate::logger::info(&format!($($arg)*));
     };
 }
 
-#[cfg(not(feature = "console"))]
+#[cfg(not(any(feature = "console", feature = "logging")))]
 macro_rules! log_info {
     ($($arg:tt)*) => {};
 }
 
-#[cfg(feature = "console")]
+#[cfg(any(feature = "console", feature = "logging"))]
 macro_rules! log_warn {
     ($($arg:tt)*) => {
         crate::logger::warn(&format!($($arg)*));
     };
 }
 
-#[cfg(not(feature = "console"))]
+#[cfg(not(any(feature = "console", feature = "logging")))]
 macro_rules! log_warn {
     ($($arg:tt)*) => {};
 }
 
-#[cfg(feature = "console")]
+#[cfg(any(feature = "console", feature = "logging"))]
 macro_rules! log_error {
     ($($arg:tt)*) => {
         crate::logger::error(&format!($($arg)*));
     };
 }
 
-#[cfg(not(feature = "console"))]
+#[cfg(not(any(feature = "console", feature = "logging")))]
 macro_rules! log_error {
     ($($arg:tt)*) => {};
 }
@@ -48,6 +48,10 @@ mod win;
 #[cfg(windows)]
 fn main() {
     logger::init();
+    #[cfg(any(feature = "console", feature = "logging"))]
+    if let Some(path) = logger::log_path() {
+        log_info!("log file: {}", path.display());
+    }
     log_info!(
         "lol_plugin start (version={}, pid={})",
         env!("CARGO_PKG_VERSION"),

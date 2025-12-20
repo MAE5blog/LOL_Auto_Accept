@@ -99,7 +99,9 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
                 fullmuted_this_game = true;
                 let stop = stop.clone();
                 std::thread::spawn(move || {
-                    let _ = crate::ingame::try_fullmute_all_after_enter_game(stop);
+                    if let Err(_err) = crate::ingame::try_fullmute_all_after_enter_game(stop) {
+                        log_warn!("ingame fullmute failed: {_err:?}");
+                    }
                 });
             }
         } else {

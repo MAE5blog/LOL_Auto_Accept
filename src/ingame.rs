@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -7,23 +6,66 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
+
 pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
-    std::thread::sleep(Duration::from_secs(1));
+    log_info!("ingame fullmute: start (waiting for game foreground)");
 
     let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last_foreground_name: Option<String> = None;
+    let mut last_log = Instant::now() - Duration::from_secs(10);
+
     while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
-        if is_foreground_league_game()? {
-            send_chat_command("/fullmute all")?;
-            return Ok(());
+        match foreground_process() {
+            Ok(Some(info)) => {
+                if info.exe_name.eq_ignore_ascii_case("League of Legends.exe") {
+                    log_info!(
+                        "ingame fullmute: detected game foreground (pid={}, exe={})",
+                        info.pid,
+                        info.exe_path.display()
+                    );
+                    std::thread::sleep(Duration::from_secs(1));
+                    send_chat_command("/fullmute all").context("send /fullmute all")?;
+                    log_info!("ingame fullmute: sent /fullmute all");
+                    return Ok(());
+                }
+
+                if last_foreground_name.as_deref() != Some(info.exe_name.as_str())
+                    || last_log.elapsed() >= Duration::from_secs(2)
+                {
+                    log_info!(
+                        "ingame fullmute: waiting (foreground pid={}, exe_name={}, exe={})",
+                        info.pid,
+                        info.exe_name,
+                        info.exe_path.display()
+                    );
+                    last_foreground_name = Some(info.exe_name);
+                    last_log = Instant::now();
+                }
+            }
+            Ok(None) => {}
+            Err(_err) => {
+                log_warn!("ingame fullmute: foreground query failed: {_err:?}");
+                last_log = Instant::now();
+            }
         }
 
         std::thread::sleep(Duration::from_millis(250));
     }
 
+    log_warn!("ingame fullmute: gave up (timeout or stop requested)");
     Ok(())
 }
 
-fn is_foreground_league_game() -> anyhow::Result<bool> {
+struct ForegroundProcessInfo {
+    exe_name: String,
+    #[cfg(any(feature = "console", feature = "logging"))]
+    pid: u32,
+    #[cfg(any(feature = "console", feature = "logging"))]
+    exe_path: std::path::PathBuf,
+}
+
+fn foreground_process() -> anyhow::Result<Option<ForegroundProcessInfo>> {
     use windows::Win32::{
         Foundation::CloseHandle,
         System::Threading::{
@@ -36,43 +78,44 @@ fn is_foreground_league_game() -> anyhow::Result<bool> {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.is_invalid() {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut pid = 0u32;
         let _tid = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
         if pid == 0 {
-            return Ok(false);
+            return Ok(None);
         }
 
-        let process = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-            Ok(p) => p,
-            Err(_) => return Ok(false),
-        };
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .with_context(|| format!("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) pid={pid}"))?;
 
         let mut buf = vec![0u16; 32 * 1024];
         let mut len: u32 = buf.len().try_into().unwrap_or(u32::MAX);
-        let ok = QueryFullProcessImageNameW(
+        QueryFullProcessImageNameW(
             process,
             PROCESS_NAME_FORMAT(0),
             windows::core::PWSTR(buf.as_mut_ptr()),
             &mut len,
         )
-        .is_ok();
+        .with_context(|| format!("QueryFullProcessImageNameW pid={pid}"))?;
 
         let _ = CloseHandle(process);
 
-        if !ok {
-            return Ok(false);
-        }
-
         let exe = String::from_utf16_lossy(&buf[..len as usize]);
-        let name = Path::new(&exe)
+        let exe_path = std::path::PathBuf::from(exe);
+        let exe_name = exe_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        Ok(name.eq_ignore_ascii_case("League of Legends.exe"))
+        Ok(Some(ForegroundProcessInfo {
+            exe_name,
+            #[cfg(any(feature = "console", feature = "logging"))]
+            pid,
+            #[cfg(any(feature = "console", feature = "logging"))]
+            exe_path,
+        }))
     }
 }
 
@@ -218,11 +261,19 @@ fn keyboard_input(
 fn send_inputs(
     inputs: &[windows::Win32::UI::Input::KeyboardAndMouse::INPUT],
 ) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+    use windows::Win32::{
+        Foundation::GetLastError,
+        UI::Input::KeyboardAndMouse::{SendInput, INPUT},
+    };
 
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent != inputs.len() as u32 {
-        anyhow::bail!("SendInput sent {sent}/{}", inputs.len());
+        let last = unsafe { GetLastError() };
+        anyhow::bail!(
+            "SendInput sent {sent}/{} (GetLastError={:?})",
+            inputs.len(),
+            last
+        );
     }
     Ok(())
 }
