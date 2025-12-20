@@ -9,9 +9,16 @@ use std::{
 use anyhow::Context;
 
 pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
-    log_info!("ingame fullmute: start (waiting for game foreground)");
+    log_info!("ingame fullmute: start");
 
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let client = build_local_http_client()?;
+
+    let deadline = Instant::now() + Duration::from_secs(180);
+    if !wait_for_liveclient(&stop, &client, deadline)? {
+        return Ok(());
+    }
+
+    log_info!("ingame fullmute: liveclient ready, waiting for game foreground");
     let mut last_foreground_name: Option<String> = None;
     let mut last_log = Instant::now() - Duration::from_secs(10);
 
@@ -19,11 +26,14 @@ pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Resul
         match foreground_process() {
             Ok(Some(info)) => {
                 if info.exe_name.eq_ignore_ascii_case("League of Legends.exe") {
+                    #[cfg(any(feature = "console", feature = "logging"))]
                     log_info!(
                         "ingame fullmute: detected game foreground (pid={}, exe={})",
                         info.pid,
                         info.exe_path.display()
                     );
+                    #[cfg(not(any(feature = "console", feature = "logging")))]
+                    log_info!("ingame fullmute: detected game foreground");
                     std::thread::sleep(Duration::from_secs(1));
                     send_chat_command("/fullmute all").context("send /fullmute all")?;
                     log_info!("ingame fullmute: sent /fullmute all");
@@ -55,6 +65,88 @@ pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Resul
 
     log_warn!("ingame fullmute: gave up (timeout or stop requested)");
     Ok(())
+}
+
+fn build_local_http_client() -> anyhow::Result<reqwest::blocking::Client> {
+    reqwest::blocking::ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build local http client")
+}
+
+fn wait_for_liveclient(
+    stop: &AtomicBool,
+    client: &reqwest::blocking::Client,
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    let mut last_log = Instant::now() - Duration::from_secs(10);
+    let mut last_err: Option<String> = None;
+
+    while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+        match liveclient_activeplayername(client) {
+            Ok(Some(_name)) => {
+                #[cfg(any(feature = "console", feature = "logging"))]
+                log_info!(
+                    "ingame fullmute: liveclient ready (activeplayername={})",
+                    _name
+                );
+                #[cfg(not(any(feature = "console", feature = "logging")))]
+                log_info!("ingame fullmute: liveclient ready");
+                return Ok(true);
+            }
+            Ok(None) => {}
+            Err(_err) => {
+                last_err = Some(format!("{_err:?}"));
+            }
+        }
+
+        if last_log.elapsed() >= Duration::from_secs(3) {
+            if let Some(_err) = last_err.as_deref() {
+                log_info!("ingame fullmute: waiting for liveclient... (last_err={_err})");
+            } else {
+                log_info!("ingame fullmute: waiting for liveclient...");
+            }
+            last_log = Instant::now();
+        }
+
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    log_warn!("ingame fullmute: liveclient not ready before timeout");
+    Ok(false)
+}
+
+fn liveclient_activeplayername(
+    client: &reqwest::blocking::Client,
+) -> anyhow::Result<Option<String>> {
+    let bases = ["https://127.0.0.1:2999", "http://127.0.0.1:2999"];
+    for base in bases {
+        let url = format!("{base}/liveclientdata/activeplayername");
+        let response = match client.get(&url).send() {
+            Ok(r) => r,
+            Err(_err) => continue,
+        };
+
+        if !response.status().is_success() {
+            continue;
+        }
+
+        let body = response.text().unwrap_or_default();
+        if let Ok(name) = serde_json::from_str::<String>(&body) {
+            if !name.trim().is_empty() {
+                return Ok(Some(name));
+            }
+        }
+
+        let name = body.trim().trim_matches('"').to_string();
+        if !name.is_empty() {
+            return Ok(Some(name));
+        }
+    }
+
+    Ok(None)
 }
 
 struct ForegroundProcessInfo {
@@ -122,10 +214,13 @@ fn foreground_process() -> anyhow::Result<Option<ForegroundProcessInfo>> {
 fn send_chat_command(text: &str) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
 
+    log_info!("ingame fullmute: send Enter");
     send_key(VK_RETURN)?;
-    std::thread::sleep(Duration::from_millis(80));
+    std::thread::sleep(Duration::from_millis(200));
+    log_info!("ingame fullmute: send text");
     send_text(text)?;
-    std::thread::sleep(Duration::from_millis(30));
+    std::thread::sleep(Duration::from_millis(100));
+    log_info!("ingame fullmute: send Enter");
     send_key(VK_RETURN)?;
     Ok(())
 }
@@ -212,29 +307,72 @@ fn send_key_press(
     vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
 ) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP;
-    send_inputs(&[
-        keyboard_input(
-            vk,
-            0,
-            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
-        ),
-        keyboard_input(vk, 0, KEYEVENTF_KEYUP),
-    ])
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+
+    if let Some(scan) = scancode_for_vk(vk) {
+        send_inputs(&[
+            keyboard_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                scan,
+                KEYEVENTF_SCANCODE,
+            ),
+            keyboard_input(
+                windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+                scan,
+                KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+            ),
+        ])
+    } else {
+        send_inputs(&[
+            keyboard_input(
+                vk,
+                0,
+                windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+            ),
+            keyboard_input(vk, 0, KEYEVENTF_KEYUP),
+        ])
+    }
 }
 
 fn send_key_down(
     vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
 ) -> anyhow::Result<()> {
-    send_inputs(&[keyboard_input(
-        vk,
-        0,
-        windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
-    )])
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+
+    if let Some(scan) = scancode_for_vk(vk) {
+        send_inputs(&[keyboard_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+            scan,
+            KEYEVENTF_SCANCODE,
+        )])
+    } else {
+        send_inputs(&[keyboard_input(
+            vk,
+            0,
+            windows::Win32::UI::Input::KeyboardAndMouse::KEYBD_EVENT_FLAGS(0),
+        )])
+    }
 }
 
 fn send_key_up(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> anyhow::Result<()> {
     use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP;
-    send_inputs(&[keyboard_input(vk, 0, KEYEVENTF_KEYUP)])
+    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+
+    if let Some(scan) = scancode_for_vk(vk) {
+        send_inputs(&[keyboard_input(
+            windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
+            scan,
+            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+        )])
+    } else {
+        send_inputs(&[keyboard_input(vk, 0, KEYEVENTF_KEYUP)])
+    }
+}
+
+fn scancode_for_vk(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> Option<u16> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
+    u16::try_from(scan).ok().filter(|&s| s != 0)
 }
 
 fn keyboard_input(
