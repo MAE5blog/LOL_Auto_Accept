@@ -5,6 +5,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=assets/lol_plugin.rc");
     println!("cargo:rerun-if-changed=assets/lol_plugin.ico");
+    println!("cargo:rerun-if-changed=assets/lol_plugin.manifest");
 
     embed_resource::compile("assets/lol_plugin.rc", embed_resource::NONE)
         .manifest_optional()

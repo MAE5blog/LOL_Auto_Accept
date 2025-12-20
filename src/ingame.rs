@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 
-const MIN_GAME_TIME_SECS: f64 = 10.0;
+const MIN_GAME_TIME_SECS: f64 = 2.0;
 
 pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     log_info!("ingame fullmute: start");
@@ -39,7 +39,15 @@ pub fn try_fullmute_all_after_enter_game(stop: Arc<AtomicBool>) -> anyhow::Resul
                     if let Ok(path) = capture_screen_bmp("fullmute_before") {
                         log_info!("ingame fullmute: screenshot(before) {}", path.display());
                     }
-                    send_chat_command("/fullmute all").context("send /fullmute all")?;
+                    match send_chat_command("/fullmute all", info.pid, info.tid)
+                        .context("send /fullmute all")
+                    {
+                        Ok(()) => {}
+                        Err(_err) => {
+                            log_warn!("ingame fullmute: send failed, will retry: {_err:?}");
+                            continue;
+                        }
+                    }
                     #[cfg(any(feature = "console", feature = "logging"))]
                     if let Ok(path) = capture_screen_bmp("fullmute_after") {
                         log_info!("ingame fullmute: screenshot(after) {}", path.display());
@@ -327,8 +335,8 @@ fn write_bmp_32bpp(
 
 struct ForegroundProcessInfo {
     exe_name: String,
-    #[cfg(any(feature = "console", feature = "logging"))]
     pid: u32,
+    tid: u32,
     #[cfg(any(feature = "console", feature = "logging"))]
     exe_path: std::path::PathBuf,
 }
@@ -350,7 +358,10 @@ fn foreground_process() -> anyhow::Result<Option<ForegroundProcessInfo>> {
         }
 
         let mut pid = 0u32;
-        let _tid = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+        let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+        if tid == 0 {
+            return Ok(None);
+        }
         if pid == 0 {
             return Ok(None);
         }
@@ -379,40 +390,67 @@ fn foreground_process() -> anyhow::Result<Option<ForegroundProcessInfo>> {
 
         Ok(Some(ForegroundProcessInfo {
             exe_name,
-            #[cfg(any(feature = "console", feature = "logging"))]
             pid,
+            tid,
             #[cfg(any(feature = "console", feature = "logging"))]
             exe_path,
         }))
     }
 }
 
-fn send_chat_command(text: &str) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+fn send_chat_command(text: &str, foreground_pid: u32, foreground_tid: u32) -> anyhow::Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, VK_RETURN};
+
+    ensure_foreground_pid(foreground_pid)?;
+    let hkl = unsafe { GetKeyboardLayout(foreground_tid) };
+    let hkl = if hkl.is_invalid() {
+        unsafe { GetKeyboardLayout(0) }
+    } else {
+        hkl
+    };
+
+    #[cfg(any(feature = "console", feature = "logging"))]
+    log_info!("ingame fullmute: hkl={:?}", hkl);
 
     log_info!("ingame fullmute: send Enter");
-    send_key(VK_RETURN)?;
+    send_key(VK_RETURN, hkl)?;
     std::thread::sleep(Duration::from_millis(350));
+    #[cfg(any(feature = "console", feature = "logging"))]
+    if let Ok(path) = capture_screen_bmp("fullmute_chat_open") {
+        log_info!("ingame fullmute: screenshot(chat_open) {}", path.display());
+    }
     log_info!("ingame fullmute: send text");
-    send_text(text)?;
+    ensure_foreground_pid(foreground_pid)?;
+    send_text(text, hkl, foreground_pid)?;
     std::thread::sleep(Duration::from_millis(250));
     log_info!("ingame fullmute: send Enter");
-    send_key(VK_RETURN)?;
+    ensure_foreground_pid(foreground_pid)?;
+    send_key(VK_RETURN, hkl)?;
     Ok(())
 }
 
-fn send_text(text: &str) -> anyhow::Result<()> {
+fn send_text(
+    text: &str,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+    foreground_pid: u32,
+) -> anyhow::Result<()> {
     for ch in text.chars() {
-        send_char(ch)?;
+        ensure_foreground_pid(foreground_pid)?;
+        send_char(ch, hkl)?;
         std::thread::sleep(Duration::from_millis(25));
     }
     Ok(())
 }
 
-fn send_char(ch: char) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VkKeyScanW, VK_CONTROL, VK_MENU, VK_SHIFT};
+fn send_char(
+    ch: char,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+) -> anyhow::Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VkKeyScanExW, VK_CONTROL, VK_MENU, VK_SHIFT,
+    };
 
-    let code = unsafe { VkKeyScanW(ch as u16) };
+    let code = unsafe { VkKeyScanExW(ch as u16, hkl) };
     if code == -1 {
         return send_unicode_char(ch);
     }
@@ -429,25 +467,28 @@ fn send_char(ch: char) -> anyhow::Result<()> {
     }
 
     if needs_shift {
-        send_key_down(VK_SHIFT)?;
+        send_key_down(VK_SHIFT, hkl)?;
     }
     if needs_ctrl {
-        send_key_down(VK_CONTROL)?;
+        send_key_down(VK_CONTROL, hkl)?;
     }
     if needs_alt {
-        send_key_down(VK_MENU)?;
+        send_key_down(VK_MENU, hkl)?;
     }
 
-    send_key_press(windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk))?;
+    send_key_press(
+        windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(vk),
+        hkl,
+    )?;
 
     if needs_alt {
-        send_key_up(VK_MENU)?;
+        send_key_up(VK_MENU, hkl)?;
     }
     if needs_ctrl {
-        send_key_up(VK_CONTROL)?;
+        send_key_up(VK_CONTROL, hkl)?;
     }
     if needs_shift {
-        send_key_up(VK_SHIFT)?;
+        send_key_up(VK_SHIFT, hkl)?;
     }
 
     Ok(())
@@ -475,29 +516,40 @@ fn send_unicode_char(ch: char) -> anyhow::Result<()> {
     ])
 }
 
-fn send_key(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> anyhow::Result<()> {
-    send_key_press(vk)
+fn send_key(
+    vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+) -> anyhow::Result<()> {
+    send_key_press(vk, hkl)
 }
 
 fn send_key_press(
     vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
 ) -> anyhow::Result<()> {
-    send_key_down(vk)?;
+    send_key_down(vk, hkl)?;
     std::thread::sleep(Duration::from_millis(30));
-    send_key_up(vk)?;
+    send_key_up(vk, hkl)?;
     Ok(())
 }
 
 fn send_key_down(
     vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
 ) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_SCANCODE,
+    };
 
-    if let Some(scan) = scancode_for_vk(vk) {
+    if let Some(scan) = scancode_for_vk(vk, hkl) {
+        let mut flags = KEYEVENTF_SCANCODE;
+        if scan.extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
         send_inputs(&[keyboard_input(
             windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-            scan,
-            KEYEVENTF_SCANCODE,
+            scan.code,
+            flags,
         )])
     } else {
         send_inputs(&[keyboard_input(
@@ -508,25 +560,52 @@ fn send_key_down(
     }
 }
 
-fn send_key_up(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> anyhow::Result<()> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP;
-    use windows::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_SCANCODE;
+fn send_key_up(
+    vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+) -> anyhow::Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    };
 
-    if let Some(scan) = scancode_for_vk(vk) {
+    if let Some(scan) = scancode_for_vk(vk, hkl) {
+        let mut flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        if scan.extended {
+            flags |= KEYEVENTF_EXTENDEDKEY;
+        }
         send_inputs(&[keyboard_input(
             windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(0),
-            scan,
-            KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP,
+            scan.code,
+            flags,
         )])
     } else {
         send_inputs(&[keyboard_input(vk, 0, KEYEVENTF_KEYUP)])
     }
 }
 
-fn scancode_for_vk(vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) -> Option<u16> {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
-    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
-    u16::try_from(scan).ok().filter(|&s| s != 0)
+#[derive(Clone, Copy)]
+struct ScanCode {
+    code: u16,
+    extended: bool,
+}
+
+fn scancode_for_vk(
+    vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY,
+    hkl: windows::Win32::UI::Input::KeyboardAndMouse::HKL,
+) -> Option<ScanCode> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyExW, MAPVK_VK_TO_VSC_EX};
+    let scan = unsafe { MapVirtualKeyExW(vk.0 as u32, MAPVK_VK_TO_VSC_EX, hkl) };
+    if scan == 0 {
+        return None;
+    }
+
+    let code = (scan & 0xff) as u16;
+    if code == 0 {
+        return None;
+    }
+    let prefix = ((scan >> 8) & 0xff) as u8;
+    let extended = prefix == 0xe0 || prefix == 0xe1;
+    Some(ScanCode { code, extended })
 }
 
 fn keyboard_input(
@@ -568,4 +647,25 @@ fn send_inputs(
         );
     }
     Ok(())
+}
+
+fn ensure_foreground_pid(expected_pid: u32) -> anyhow::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            anyhow::bail!("no foreground window");
+        }
+
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid as *mut u32));
+        if pid == 0 {
+            anyhow::bail!("foreground pid unavailable");
+        }
+        if pid != expected_pid {
+            anyhow::bail!("foreground changed (expected pid={expected_pid}, got pid={pid})");
+        }
+        Ok(())
+    }
 }
