@@ -37,6 +37,8 @@ macro_rules! log_error {
 }
 
 #[cfg(windows)]
+mod ingame;
+#[cfg(windows)]
 mod lcu;
 #[cfg(windows)]
 mod logger;

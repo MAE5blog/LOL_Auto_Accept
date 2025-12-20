@@ -59,12 +59,14 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
     let mut accepted_this_ready_check = false;
     let mut connection: Option<(LcuAuth, String)> = None;
     let mut last_phase: Option<String> = None;
+    let mut fullmuted_this_game = false;
 
     while !stop.load(Ordering::Relaxed) {
         if connection.is_none() {
             connection = discover_connection(&client, &overrides);
             accepted_this_ready_check = false;
             last_phase = None;
+            fullmuted_this_game = false;
 
             if connection.is_none() {
                 std::thread::sleep(Duration::from_secs(1));
@@ -90,6 +92,18 @@ pub fn run(stop: Arc<AtomicBool>, overrides: LcuOverrides) {
         if last_phase.as_deref() != Some(phase.as_str()) {
             log_info!("gameflow phase: {phase}");
             last_phase = Some(phase.clone());
+        }
+
+        if phase == "InProgress" {
+            if !fullmuted_this_game {
+                fullmuted_this_game = true;
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let _ = crate::ingame::try_fullmute_all_after_enter_game(stop);
+                });
+            }
+        } else {
+            fullmuted_this_game = false;
         }
 
         if phase == "ReadyCheck" {
